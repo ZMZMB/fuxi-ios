@@ -145,6 +145,8 @@ jobs:
           (cd source && python3 tools/test-fuxi-wlan-m6i.py)
           (cd source && python3 tools/test-fuxi-wlan-rails.py)
           (cd source && python3 tools/test-fuxi-wlan-w18.py)
+          git -C source apply --check ../harness/patches/kernel-fuxi-canvas.patch
+          git -C source apply ../harness/patches/kernel-fuxi-canvas.patch
       - name: Download the pinned public ath12k link input
         if: ${{ inputs.ath12k }}
         uses: actions/download-artifact@v4
