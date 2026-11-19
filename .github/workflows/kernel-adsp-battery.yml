@@ -170,6 +170,7 @@ jobs:
           cd source
           git apply --check ../harness/patches/kernel-fuxi-canvas.patch
           git apply ../harness/patches/kernel-fuxi-canvas.patch
+          python3 tools/sync-fuxi-unixnu.py
           xcodebuild -version
           if bash tools/ci/build.sh kernel-metal4 > kernel-console.log 2>&1; then
             echo 'Kernel build and audit passed; complete output is in the artifact logs/build.log.'
