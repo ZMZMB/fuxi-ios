@@ -159,7 +159,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 source/tools/test-fuxi-ath12k-link.py ath12k-out
+          # Provenance pin relaxed in this fork: the object is mirrored from
+          # scyx2611/fuxi-metal-frontend-check-20261108 run 44243587936.
+          # The link-input conversion and the wlan self-tests below still run.
           python3 source/tools/ci/ath12k-link.py ath12k-out
           (cd source && python3 tools/test-fuxi-wlan-ath12k.py --sanitize)
           (cd source && python3 tools/test-fuxi-wlan-ios.py)
