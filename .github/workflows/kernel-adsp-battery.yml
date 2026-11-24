@@ -151,6 +151,7 @@ jobs:
         with:
           name: fuxi-ath12k-objects
           path: ath12k-out
+          repository: scyx2611/fuxi-metal-frontend-check-20261108
           run-id: 44010197996
           github-token: ${{ github.token }}
       - name: Verify the optional ath12k link input
