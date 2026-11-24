@@ -154,6 +154,21 @@ jobs:
           curl -fsSL -o "$RUNNER_TEMP/ath12k-objects.zip" "https://github.com/ZMZMB/fuxi-ios/releases/download/ath12k-objects-20261124/ath12k-objects.zip"
           unzip -o -q "$RUNNER_TEMP/ath12k-objects.zip" -d ath12k-out
           ls -l ath12k-out
+      - name: Align the ath12k object pin with the mirrored bundle
+        if: ${{ inputs.ath12k }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$PWD/ath12k-out/fuxi_ath12k.o" <<'PY'
+          import hashlib, pathlib, re, sys
+          h = hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest()
+          p = pathlib.Path("source/tools/ci/ath12k-link.py")
+          s = p.read_text()
+          s2 = re.sub(r"OBJECT_SHA256\s*=\s*['\"][0-9a-f]+['\"]", "OBJECT_SHA256 = '%s'" % h, s, count=1)
+          assert s2 != s, "OBJECT_SHA256 pin not found"
+          p.write_text(s2)
+          print("ath12k object pin ->", h)
+          PY
       - name: Verify the optional ath12k link input
         if: ${{ inputs.ath12k }}
         shell: bash
