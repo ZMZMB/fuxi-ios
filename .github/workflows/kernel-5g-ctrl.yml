@@ -1,0 +1,14 @@
+name: Build Fuxi kernel, 8 GB (full) layout, ath12k OFF (control)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  kernel:
+    uses: ./.github/workflows/kernel-adsp-battery.yml
+    with:
+      ram_layout: full
+      artifact_name: fuxi-kernel-ctrl-full
+      runner_label: macos-15-intel
+      ath12k: false
