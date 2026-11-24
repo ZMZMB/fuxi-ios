@@ -147,13 +147,13 @@ jobs:
           (cd source && python3 tools/test-fuxi-wlan-w18.py)
       - name: Download the pinned public ath12k link input
         if: ${{ inputs.ath12k }}
-        uses: actions/download-artifact@v4
-        with:
-          name: fuxi-ath12k-objects
-          path: ath12k-out
-          repository: scyx2611/fuxi-metal-frontend-check-20261108
-          run-id: 44010197996
-          github-token: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ath12k-out
+          curl -fsSL -o "$RUNNER_TEMP/ath12k-objects.zip" "https://github.com/ZMZMB/fuxi-ios/releases/download/ath12k-objects-20261124/ath12k-objects.zip"
+          unzip -o -q "$RUNNER_TEMP/ath12k-objects.zip" -d ath12k-out
+          ls -l ath12k-out
       - name: Verify the optional ath12k link input
         if: ${{ inputs.ath12k }}
         shell: bash
