@@ -24,8 +24,13 @@ def read(p):
     return open(p, encoding='utf-8', errors='surrogateescape').read()
 
 
-def patch_targets(harness):
+def patch_targets(harness, only=None):
     files = []
+    if only:
+        for line in read(only).splitlines():
+            if line.startswith('+++ b/'):
+                files.append(line[6:].strip())
+        return sorted({f for f in files if not f.startswith('xnu/patches/')})
     for dp, dn, fn in os.walk(os.path.join(harness, 'patches')):
         for f in fn:
             if not f.endswith('.patch'):
@@ -103,7 +108,8 @@ def check_touched(source, targets):
 
 def main():
     harness, source = sys.argv[1], sys.argv[2]
-    targets = patch_targets(harness)
+    only = sys.argv[3] if len(sys.argv) > 3 else None
+    targets = patch_targets(harness, only)
     print(f'touched files: {len(targets)}')
     for t in targets:
         print('  ', t)
