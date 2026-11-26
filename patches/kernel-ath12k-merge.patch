@@ -1,20 +1,23 @@
 --- a/xnu/fuxi-scanout/SweetSurface.cpp
 +++ b/xnu/fuxi-scanout/SweetSurface.cpp
-@@ -785,6 +785,42 @@
+@@ -785,6 +785,55 @@
  	return enabled;
  }
  
 +/*
 + * ath12k WLAN combination: fuxiwlan=1 and fuxiwlanath=1 (the boot that also
 + * links fuxi_ath12k.o). On this chain the GPU scanout and its CPU oracle only
-+ * carry an 8-bit BGRA single-plane layout; a 10-bit / two-plane surface
-+ * (e.g. 'b3a8', kCVPixelFormatType_30RGBLE_8A_BiPlanar) cannot be presented or
-+ * copied directly. v16 no longer refuses the layout: the surface is accepted at
-+ * the kernel boundary and unpacked to BGRA8 on the CPU present path (see the
-+ * convert branch in SweetFramebuffer::present). Without both args the
-+ * pre-existing acceptance is kept: single fuxiwlan, single fuxiath, and the
-+ * default control boot are unchanged.
++ * carry an 8-bit BGRA single-plane layout; a 10-bit / two-plane or packed mask
++ * surface cannot be presented raw. The surface is accepted at the kernel
++ * boundary and decompressed to BGRA8 on the CPU present path (see the convert
++ * branch in SweetFramebuffer::present). Without both args the pre-existing
++ * acceptance is kept: single fuxiwlan, single fuxiath, and the default control
++ * boot are unchanged.
 + */
++#define SWEET_FMT_BGRA8   0x42475241u  /* 'BGRA' */
++#define SWEET_FMT_B3A8    0x62336138u  /* 'b3a8' 30RGBLE_8A_BiPlanar */
++#define SWEET_FMT_LA08    0x4c413038u  /* 'LA08' packed L/A mask, bpe2 */
++
 +static int
 +sweet_surface_combo_active(void)
 +{
@@ -28,22 +31,32 @@
 +	return cached;
 +}
 +
-+/* True only in the ath12k combo for a surface the scanout cannot carry raw.
-+ * A plain BGRA8 single-plane surface is left untouched even in this combo. */
++/* Convert kind for the present path; 0 = plain BGRA8 / outside the combo. */
++int
++sweet_surface_convert_kind(SweetSurface *s)
++{
++	if (!s || !sweet_surface_combo_active()) return 0;
++	if (s->pixelFormat == SWEET_FMT_BGRA8 && s->planeCount <= 1 &&
++	    s->bytesPerElement == 4 && s->elementWidth == 1 && s->elementHeight == 1)
++		return 0;
++	if (s->pixelFormat == SWEET_FMT_B3A8 && s->planeCount == 2)
++		return 1;
++	if (s->pixelFormat == SWEET_FMT_LA08 && s->planeCount <= 1 &&
++	    s->bytesPerElement == 2)
++		return 2;
++	return 3; /* recognized combo non-BGRA, but no decompressor here yet */
++}
++
 +bool
 +sweet_surface_needs_convert(SweetSurface *s)
 +{
-+	if (!s || !sweet_surface_combo_active()) return false;
-+	if (s->pixelFormat == 0x42475241u && s->planeCount <= 1 &&
-+	    s->bytesPerElement == 4 && s->elementWidth == 1 && s->elementHeight == 1)
-+		return false;
-+	return true;
++	return sweet_surface_convert_kind(s) != 0;
 +}
 +
  /* Geometry from the creation properties (IOSurface.h keys). */
  static IOReturn
  sweet_surface_layout(SweetSurface *s, OSDictionary *props)
-@@ -852,6 +888,14 @@
+@@ -852,6 +901,14 @@
  			}
  		}
  		s->planeCount = planes->getCount();
@@ -60,12 +73,15 @@
  	uint64_t alloc = sweet_dict_u32(props, "IOSurfaceAllocSize", 0);
 --- a/xnu/fuxi-scanout/SweetSurface.h
 +++ b/xnu/fuxi-scanout/SweetSurface.h
-@@ -81,6 +81,10 @@
+@@ -81,6 +81,13 @@
  bool sweet_surface_display_hold(SweetSurface *);
  void sweet_surface_display_drop(SweetSurface *);
  
-+/* ath12k combo only: surface the scanout cannot carry raw (10-bit / two-plane);
-+ * present path unpacks it to BGRA8. Plain BGRA8 single-plane returns false. */
++/* ath12k combo only: surface the scanout cannot carry raw. Convert kinds:
++ * 0 none (plain BGRA8 single-plane, or outside the combo), 1 b3a8 two-plane
++ * 10-bit, 2 LA08 bpe2 single-plane, 3 recognized but not decompressible here.
++ * sweet_surface_needs_convert() is kind != 0. */
++int  sweet_surface_convert_kind(SweetSurface *);
 +bool sweet_surface_needs_convert(SweetSurface *);
 +
  /*
@@ -73,7 +89,40 @@
   * retained surface that stays in the id table until released by the caller
 --- a/xnu/fuxi-unixnu/SweetFramebuffer.cpp
 +++ b/xnu/fuxi-unixnu/SweetFramebuffer.cpp
-@@ -1234,6 +1234,23 @@
+@@ -658,7 +658,11 @@
+  fScanoutLog = log == 1 ? 2 : fScanout ? 1 : 0;
+  if (scanout == 1 && !fScanout)
+   IOLog("FUXI SCANOUT: unavailable, requires sweetfb_noconsole=1 or 2; existing present path\n");
+- if (fScanout) { sweet_console_muted = 1; fConsolePaused = true; }
++ if (fScanout) {
++  sweet_console_muted = 1; fConsolePaused = true;
++  IOLog("FUXI SCANOUT: panel handed to scanout, console text released (noconsole=%d, panel 0x%llx %ux%u stride %u, default surface %u)\n",
++      quiet, (uint64_t)fPhys, fWidth, fHeight, fRowBytes, fSurface ? fSurface->id : 0);
++ }
+  fuxi_gpu_scanout_configure(fPixels, fScanout, check);
+  uint32_t nc = 0;
+  PE_parse_boot_argn("fuxigpuncimport", &nc, sizeof(nc));
+@@ -1059,8 +1063,17 @@
+   SweetSurface *sources[SWEET_FB_LAYERS]; uint64_t epochs[SWEET_FB_LAYERS]; unsigned count = 0;
+   uint64_t ready = candidate.swapped;
+   for (unsigned i = 0; i < SWEET_FB_LAYERS; i++) if (candidate.surfaces[i]) { epochs[count] = candidate.epochs[i]; sources[count++] = candidate.surfaces[i]; }
+-  if (fScanout && !sweet_surface_present_begin(sources, count, &ready, replay && candidate.shown ? NULL : epochs)) {
+-   fQueuedDefers++;
++  const uint64_t *beginEpochs = replay && candidate.shown ? NULL : epochs;
++  if (fScanout && !sweet_surface_present_begin(sources, count, &ready, beginEpochs)) {
++   fQueuedDefers++; ++fPresentDrops;
++   for (unsigned i = 0; i < count; i++) {
++    SweetSurface *q = sources[i];
++    const char *why = q->gpuWriters ? "writer" : q->gpuQuarantined ? "quarantine" :
++        (beginEpochs && q->gpuWriterEpoch != beginEpochs[i]) ? "epoch" : "busy";
++    IOLog("FUXI SCANOUT: present defer swap=%u surface=%u reject=%s writers=%u quar=%u epoch=%llu/%llu\n",
++        get32(candidate.bytes, 0x50), q->id, why, q->gpuWriters, q->gpuQuarantined,
++        beginEpochs ? q->gpuWriterEpoch : 0, beginEpochs ? beginEpochs[i] : 0);
++   }
+    if (replay && fPendingCount) { replay = false; continue; }
+    if (!replay && ++chosen < fPendingCount) continue;
+    publishDueLocked(); IOLockUnlock(fLock); return;
+@@ -1234,6 +1247,32 @@
   IOLockWakeup(fLock, fSwapStatus, false);
  }
  
@@ -91,36 +140,80 @@
 +	return (uint32_t)b | ((uint32_t)g << 8) | ((uint32_t)r << 16) | ((uint32_t)alpha << 24);
 +}
 +
++/* 'LA08' packed L/A mask (bpe2) -> BGRA8. Byte 0 luminance, byte 1 alpha
++ * (little-endian 16-bit). L is replicated to R/G/B; alpha passes through. */
++static uint32_t
++fuxi_fb_la08_unpack(uint8_t lum, uint8_t alpha)
++{
++	return (uint32_t)lum | ((uint32_t)lum << 8) | ((uint32_t)lum << 16) | ((uint32_t)alpha << 24);
++}
++
 +/* Convert-path bookkeeping (file scope, one counter per boot). */
 +static uint32_t fConvertFrames, fConvertFails, fConvertOnce;
++static uint32_t fPresentEntries, fPresentDrops;
 +
  bool
  AppleCLCD::present(const SwapRecord &record)
  {
-@@ -1316,6 +1333,55 @@
+@@ -1268,15 +1307,23 @@
+ 			continue;
  		}
+ 		SweetSurface *s = record.surfaces[layer]; if (s) s->retain();
++		++fPresentEntries;
+ 		if (sweet_fb_swaps_logged < 16) {
+ 			sweet_fb_swaps_logged++;
+ 			IOLog("SWEET FB: swap %u layer %u surface %u %ux%u fmt 0x%x bpr %u a %d,%d %ux%u b %d,%d %dx%d\n",
+ 			    get32(rec, 0x50), layer, id, s ? s->width : 0, s ? s->height : 0,
+ 			    s ? s->pixelFormat : 0, s ? s->bytesPerRow : 0, sx, sy, get32(a, 8),
+ 			    get32(a, 12), dx, dy, w, h);
++		} else if (fScanoutLog == 2) {
++			IOLog("FUXI SCANOUT: present-in swap=%u layer=%u surface=%u fmt=0x%x planes=%u bpe=%u bpr=%u src=%d,%d crop=%dx%d dst=%d,%d\n",
++			    get32(rec, 0x50), layer, id, s ? s->pixelFormat : 0, s ? s->planeCount : 0,
++			    s ? s->bytesPerElement : 0, s ? s->bytesPerRow : 0, sx, sy, w, h, dx, dy);
+ 		}
+ 		if (s == NULL || s == fSurface) {
+ 			fShadowValid = false;
++			if (s == fSurface && fScanoutLog == 2)
++				IOLog("FUXI SCANOUT: present direct-to-panel swap=%u surface=%u (default surface, zero copy)\n",
++				    get32(rec, 0x50), id);
+ 			OSSafeReleaseNULL(s);
+ 			continue;
+ 		}
+@@ -1317,13 +1364,92 @@
  		if (h > (int32_t)fHeight - dy) {
  			h = (int32_t)fHeight - dy;
-+		}
-+		if (sweet_surface_needs_convert(s)) {
-+			const struct sweet_surface_plane *p0 = NULL, *p1 = NULL;
+ 		}
++		int ckind = sweet_surface_convert_kind(s);
++		if (ckind != 0) {
 +			uint64_t dlen = s->memory ? s->memory->getLength() : 0;
 +			const uint8_t *base = (const uint8_t *)(uintptr_t)src;
-+			bool ok = base != NULL && dlen > 0 && s->planeCount == 2 &&
-+			    s->planes[0].bytesPerElement == 4 && s->planes[1].bytesPerElement == 1 &&
-+			    s->planes[0].bytesPerRow > 0 && s->planes[1].bytesPerRow > 0 &&
-+			    sx + w <= (int32_t)s->planes[0].width && sy + h <= (int32_t)s->planes[0].height;
-+			if (ok) {
-+				p0 = &s->planes[0]; p1 = &s->planes[1];
-+				uint64_t p0end = p0->offset + (uint64_t)(sy + h - 1) * p0->bytesPerRow + (uint64_t)(sx + w) * 4;
-+				uint64_t p1end = p1->offset + (uint64_t)(sy + h - 1) * p1->bytesPerRow + (uint64_t)(sx + w);
-+				uint64_t dstend = (uint64_t)(dy + h) * fRowBytes + (uint64_t)dx * 4;
-+				ok = p0end <= dlen && p1end <= dlen && dstend <= (uint64_t)fRowBytes * fHeight;
++			const struct sweet_surface_plane *p0 = NULL, *p1 = NULL;
++			bool ok = base != NULL && dlen > 0 && w > 0 && h > 0 &&
++			    sx + w <= (int32_t)s->width && sy + h <= (int32_t)s->height;
++			uint64_t srcEnd = 0, dstEnd = (uint64_t)(dy + h) * fRowBytes + (uint64_t)dx * 4;
++			if (ckind == 1) {
++				ok = ok && s->planeCount == 2 &&
++				    s->planes[0].bytesPerElement == 4 && s->planes[1].bytesPerElement == 1 &&
++				    s->planes[0].bytesPerRow > 0 && s->planes[1].bytesPerRow > 0 &&
++				    sx + w <= (int32_t)s->planes[0].width && sy + h <= (int32_t)s->planes[0].height;
++				if (ok) {
++					p0 = &s->planes[0]; p1 = &s->planes[1];
++					uint64_t p0end = p0->offset + (uint64_t)(sy + h - 1) * p0->bytesPerRow + (uint64_t)(sx + w) * 4;
++					uint64_t p1end = p1->offset + (uint64_t)(sy + h - 1) * p1->bytesPerRow + (uint64_t)(sx + w);
++					srcEnd = p0end > p1end ? p0end : p1end;
++				}
++			} else if (ckind == 2) {
++				ok = ok && s->planeCount <= 1 && s->bytesPerElement == 2 && s->bytesPerRow > 0;
++				if (ok) srcEnd = s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow + (uint64_t)(sx + w) * 2;
++			} else {
++				ok = false; /* kind 3: recognized combo non-BGRA, no decompressor here yet */
 +			}
++			ok = ok && srcEnd <= dlen && dstEnd <= (uint64_t)fRowBytes * fHeight;
 +			if (!ok) {
-+				++fConvertFails;
-+				IOLog("FUXI SCANOUT: CONVERT FAIL surface %u fmt 0x%x planes %u p0 bpe %u bpr %u p1 bpe %u bpr %u src 0x%llx len %llu crop %d,%d %dx%d fails=%u\n",
-+				    s->id, s->pixelFormat, s->planeCount,
++				++fConvertFails; ++fPresentDrops;
++				IOLog("FUXI SCANOUT: CONVERT FAIL swap=%u surface=%u kind=%u fmt 0x%x planes %u bpe %u bpr %u p0 bpe %u bpr %u p1 bpe %u bpr %u src 0x%llx len %llu crop %d,%d %dx%d fails=%u\n",
++				    get32(rec, 0x50), s->id, ckind, s->pixelFormat, s->planeCount,
++				    s->bytesPerElement, s->bytesPerRow,
 +				    s->planes[0].bytesPerElement, s->planes[0].bytesPerRow,
 +				    s->planes[1].bytesPerElement, s->planes[1].bytesPerRow,
 +				    (uint64_t)base, dlen, sx, sy, w, h, fConvertFails);
@@ -129,20 +222,30 @@
 +			}
 +			++fConvertFrames;
 +			if (fConvertOnce++ == 0)
-+				IOLog("FUXI SCANOUT: CONVERT path surface %u input fmt 0x%x planes %u bpe %u bpr %u p0 bpr %u p1 bpr %u output bpr %u crop %d,%d %dx%d frames=%u\n",
-+				    s->id, s->pixelFormat, s->planeCount, s->bytesPerElement, s->bytesPerRow,
-+				    p0->bytesPerRow, p1->bytesPerRow, fRowBytes, sx, sy, w, h, fConvertFrames);
++				IOLog("FUXI SCANOUT: CONVERT path surface %u kind=%u input fmt 0x%x planes %u bpe %u bpr %u p0 bpr %u p1 bpr %u output bpr %u crop %d,%d %dx%d frames=%u\n",
++				    s->id, ckind, s->pixelFormat, s->planeCount, s->bytesPerElement, s->bytesPerRow,
++				    p0 ? p0->bytesPerRow : 0, p1 ? p1->bytesPerRow : 0,
++				    fRowBytes, sx, sy, w, h, fConvertFrames);
 +			else if (fScanoutLog == 2)
-+				IOLog("FUXI SCANOUT: CONVERT frame=%u path=CPU input fmt 0x%x planes %u output bpr %u crop %d,%d %dx%d\n",
-+				    fConvertFrames, s->pixelFormat, s->planeCount, fRowBytes, sx, sy, w, h);
++				IOLog("FUXI SCANOUT: CONVERT frame=%u kind=%u path=CPU input fmt 0x%x planes %u output bpr %u crop %d,%d %dx%d\n",
++				    fConvertFrames, ckind, s->pixelFormat, s->planeCount, fRowBytes, sx, sy, w, h);
 +			for (int32_t y = 0; y < h; y++) {
-+				const uint32_t *row0 = (const uint32_t *)(base + p0->offset + (uint64_t)(sy + y) * p0->bytesPerRow);
-+				const uint8_t *row1 = base + p1->offset + (uint64_t)(sy + y) * p1->bytesPerRow;
 +				volatile uint32_t *out = (volatile uint32_t *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4);
-+				for (int32_t x = 0; x < w; x++) {
-+					uint32_t word;
-+					__builtin_memcpy(&word, row0 + sx + x, 4);
-+					out[x] = fuxi_fb_bgra10_unpack(word, row1[sx + x]);
++				if (ckind == 1) {
++					const uint32_t *row0 = (const uint32_t *)(base + p0->offset + (uint64_t)(sy + y) * p0->bytesPerRow);
++					const uint8_t *row1 = base + p1->offset + (uint64_t)(sy + y) * p1->bytesPerRow;
++					for (int32_t x = 0; x < w; x++) {
++						uint32_t word;
++						__builtin_memcpy(&word, row0 + sx + x, 4);
++						out[x] = fuxi_fb_bgra10_unpack(word, row1[sx + x]);
++					}
++				} else {
++					const uint8_t *row = base + s->offset + (uint64_t)(sy + y) * s->bytesPerRow;
++					for (int32_t x = 0; x < w; x++) {
++						uint8_t lum = row[(sx + x) * 2];
++						uint8_t alpha = row[(sx + x) * 2 + 1];
++						out[x] = fuxi_fb_la08_unpack(lum, alpha);
++					}
 +				}
 +			}
 +			fShadowValid = false;
@@ -150,12 +253,81 @@
 +			cpuBytes += (uint64_t)w * h * 4;
 +			s->release();
 +			continue;
- 		}
++		}
  		uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
  		    (uint64_t)(sx + w) * 4;
+ 		if (w <= 0 || h <= 0 || s->elementWidth != 1 || s->elementHeight != 1 ||
+ 		    s->memory == NULL || last > s->memory->getLength()) {
+ 			src = 0;
+ 		}
+-		if (src != 0 && bpe == 4) {
++		if (src == 0 || bpe != 4) {
++			++fPresentDrops;
++			if (fScanoutLog == 2)
++				IOLog("FUXI SCANOUT: present drop swap=%u surface=%u reason=geometry src=0x%llx bpe=%u w=%d h=%d\n",
++				    get32(rec, 0x50), s->id, (uint64_t)src, bpe, w, h);
++			s->release();
++			continue;
++		}
++		if (bpe == 4) {
+ 			int copied = 0;
+ #if defined(FUXI)
+             /* Keep CPU replay complete too if a full composed crop is available. */
+@@ -1340,14 +1466,26 @@
+             /* fuxigpuncimport bit 24: VIG0 fetches the surface itself through a display IOVA slot; any refusal copies. */
+             if (fScanout && (mask & (mask-1)) == 0) {
+              int direct = sweet_surface_direct(s, src, sx, sy, w, h);
+-             if (direct == 3) { fStageBlocks[2]++; fScanoutDefers++; s->release(); return false; }
+-             if (direct == 2) { fShadowValid = false; s->release(); continue; }
++             if (direct == 3) {
++              fStageBlocks[2]++; fScanoutDefers++; ++fPresentDrops;
++              IOLog("FUXI SCANOUT: present defer swap=%u surface=%u reason=direct-busy\n",
++                  get32(rec, 0x50), s->id);
++              s->release(); return false;
++             }
++             if (direct == 2) {
++              fShadowValid = false; ++fPresentDrops;
++              IOLog("FUXI SCANOUT: present drop swap=%u surface=%u reason=direct-refused\n",
++                  get32(rec, 0x50), s->id);
++              s->release(); continue;
++             }
+             } else if (fScanout && fuxi_gpu_scanout_direct_on()) fuxi_gpu_scanout_direct_refused(FG_DD_LAYERS);
+ 			if ((mask & (mask-1)) == 0)
+ 				copied = sweet_surface_gpu_copy(s, src, sx, sy, dx, dy, w, h);
+             if (copied == 3 || (copied < 0 && fScanout)) {
+              fStageBlocks[2]++;
+-             fScanoutDefers++;
++             fScanoutDefers++; ++fPresentDrops;
++             IOLog("FUXI SCANOUT: present defer swap=%u surface=%u reason=gpu-copy-busy copied=%d\n",
++                 get32(rec, 0x50), s->id, copied);
+              s->release();
+              return false; /* busy ring: keep the record for retry */
+             }
+@@ -1368,7 +1506,9 @@
+              int writable = fuxi_gpu_scanout_cpu_acquire();
+              if (writable != 1) {
+               fScanoutHeld = writable < 0;
+-              fScanoutDefers++;
++              fScanoutDefers++; ++fPresentDrops;
++              IOLog("FUXI SCANOUT: present defer swap=%u surface=%u reason=cpu-held writable=%d\n",
++                  get32(rec, 0x50), s->id, writable);
+               s->release();
+               return false;
+              }
+@@ -1432,6 +1572,10 @@
+   completePresent(mach_absolute_time() - t0);
+   if (cpuFrame) scanoutLog(false, cpuBytes, cpuTicks, 0);
+  }
++ if (fScanout && fScanoutLog == 2)
++  IOLog("FUXI SCANOUT: present done swap=%u gpu=%u cpu=%u entries=%u drops=%u\n",
++      get32(rec, 0x50), gpuFrame ? 1u : 0u, cpuFrame ? 1u : 0u,
++      fPresentEntries, fPresentDrops);
+ #endif
+  return true;
+ }
 --- a/xnu/fuxi-wlan/fuxi_wlan_ath12k.inc
 +++ b/xnu/fuxi-wlan/fuxi_wlan_ath12k.inc
-@@ -5,18 +5,34 @@
+@@ -5,18 +5,41 @@
  
  #define WLA_BYTES (128u << 20)
  #define WLA_BLOCKS 16384u
@@ -173,10 +345,17 @@
 +#define WLA_PARF_PA 0x01c00000ull
 +#define WLA_DBI_PA 0x60000000ull
 +#define WLA_BAR0_WINDOW 0x4000u
++/* Expected WCN7850 PCI identifiers. */
++#define WLA_PCI_VENDOR 0x17cdu
++#define WLA_PCI_DEVICE 0x1107u
  static struct fwa_arena wla_pool;
  static struct fwa_block *wla_blocks;
  static unsigned wla_express, wla_msi, wla_failed;
 +static bool wla_root_waited, wla_probed;
++/* BAR0 base/size are filled only by config-space enumeration and BAR
++ * allocation; there is no constant fallback base. */
++static uint64_t wla_bar0_pa;
++static size_t wla_bar0_size;
  static struct {
  	const char *name, *file;
 +	uint64_t expected;
@@ -194,7 +373,7 @@
  };
  
  static uint64_t
-@@ -31,6 +47,49 @@
+@@ -31,6 +54,49 @@
  wla_now_ms(void)
  {
  	return wla_now_ns() / 1000000ull;
@@ -244,7 +423,7 @@
  }
  
  static void *
-@@ -113,6 +172,99 @@
+@@ -113,6 +179,99 @@
  		return;
  	}
  	__asm__ volatile("dsb sy" ::: "memory");
@@ -344,7 +523,7 @@
  }
  
  static int
-@@ -143,35 +295,28 @@
+@@ -143,35 +302,28 @@
  	}
  	if (index == sizeof(wla_firmware) / sizeof(wla_firmware[0])) { return -1; }
  	if (!wla_firmware[index].memory) {
@@ -399,10 +578,116 @@
  	}
  	*data = wla_firmware[index].memory;
  	*bytes = wla_firmware[index].bytes;
-@@ -228,6 +373,40 @@
- 	if (!bytes || address < WL_BAR0 || address - WL_BAR0 >= 0x200000 ||
- 	    bytes > 0x200000 - (address - WL_BAR0)) { return NULL; }
- 	return (void *)(fw_va(WL_BAR0) + (address - WL_BAR0));
+@@ -222,12 +374,148 @@
+ 	return 0;
+ }
+ 
++/* PCIe config-space enumeration for the WCN7850. The config window base is
++ * the legacy glue ECAM/CFG0 aperture (WL_EPCFG); this glue parses no ADT
++ * property for it. BAR0 base is never filled from a constant: it comes either
++ * from the device's programmed BAR or from the allocation below. All accesses
++ * stay fault-contained; any failure returns nonzero for the existing
++ * containment path. */
++static int
++wla_pcie_enumerate(void)
++{
++	/* The legacy iATU CFG0 region exposes one endpoint (bus 0/dev 0/fn 0);
++	 * there is no per-BDF decode on this window. The scan range is logged. */
++	const unsigned bus = 0, dev = 0, fn = 0;
++	uint32_t id = wl_prd(WL_EPCFG);
++	uint32_t classrev = wl_prd(WL_EPCFG + 0x08);
++	uint32_t htype = wl_prd(WL_EPCFG + 0x0e) & 0xffu;
++	uint16_t vendor = id & 0xffffu, device = id >> 16;
++	uint32_t class_code = (classrev >> 16) & 0xffffu;
++	printf("FUXI ATH12K: PCIe enum config window PA %#llx; BDF %u:%u.%u id %#x vendor %#x "
++	    "device %#x class %#x header %#x candidates 1\n",
++	    (unsigned long long)WL_EPCFG, bus, dev, fn, id, vendor, device,
++	    class_code, htype);
++	if (fw_faults || vendor != WLA_PCI_VENDOR || device != WLA_PCI_DEVICE) {
++		printf("FUXI ATH12K: PCIe enum: no WCN7850 (expected vendor %#x device %#x); "
++		    "fall back to containment\n", WLA_PCI_VENDOR, WLA_PCI_DEVICE);
++		return 1;
++	}
++	/* BAR0 sizing: clear MEM decode, write all ones, read back, restore the
++	 * original BAR before the allocation attempt. */
++	uint32_t cmd = wl_prd(WL_EPCFG + 0x04);
++	uint32_t orig_lo = wl_prd(WL_EPCFG + 0x10);
++	uint32_t orig_hi = wl_prd(WL_EPCFG + 0x14);
++	wl_pwr(WL_EPCFG + 0x04, cmd & 0xffffu & ~7u);
++	wl_pwr(WL_EPCFG + 0x10, 0xffffffffu);
++	wl_pwr(WL_EPCFG + 0x14, 0xffffffffu);
++	uint32_t size_lo = wl_prd(WL_EPCFG + 0x10);
++	uint32_t size_hi = wl_prd(WL_EPCFG + 0x14);
++	wl_pwr(WL_EPCFG + 0x10, orig_lo);
++	wl_pwr(WL_EPCFG + 0x14, orig_hi);
++	printf("FUXI ATH12K: BAR0 orig %#x/%#x sizing %#x/%#x\n",
++	    orig_lo, orig_hi, size_lo, size_hi);
++	if ((size_lo & 0xfu) != 0x4u || size_hi != 0xffffffffu) {
++		printf("FUXI ATH12K: BAR0 is not a 32-bit MEM BAR (low %#x upper %#x); containment\n",
++		    size_lo, size_hi);
++		return 1;
++	}
++	uint32_t size = ~(size_lo & ~0xfu) + 1u;
++	if (!size || size > 0x200000u || (size & (size - 1))) {
++		printf("FUXI ATH12K: BAR0 size %#x out of range or not power-of-two; containment\n", size);
++		return 1;
++	}
++	/* Allocate a size-aligned slot inside the legacy iATU MEM aperture,
++	 * skipping the fixed DBI/config/sliding-window regions (interval
++	 * overlap, not base-only). */
++	uint64_t candidate = 0;
++	const uint64_t reserved[] = {
++	    WLA_DBI_PA, WLA_DBI_PA + 0x4000u,
++	    WL_EPCFG, WL_EPCFG + 0x4000u,
++	    0x60480000ull, 0x60480000ull + 0x80000u
++	};
++	for (uint64_t slot = WL_MEM_LO; slot + size <= WL_MEM_HI + 1ull; slot += size) {
++		bool overlap = false;
++		for (unsigned k = 0; k < sizeof(reserved) / sizeof(reserved[0]); k += 2) {
++			if (slot < reserved[k + 1] && slot + size > reserved[k]) { overlap = true; break; }
++		}
++		if (!overlap) { candidate = slot; break; }
++	}
++	if (!candidate) {
++		printf("FUXI ATH12K: BAR0 no free slot in aperture %#llx-%#llx; containment\n",
++		    (unsigned long long)WL_MEM_LO, (unsigned long long)WL_MEM_HI);
++		return 1;
++	}
++	wl_pwr(WL_EPCFG + 0x10, (uint32_t)candidate);
++	wl_pwr(WL_EPCFG + 0x14, 0);
++	uint32_t rb_lo = wl_prd(WL_EPCFG + 0x10);
++	uint32_t rb_hi = wl_prd(WL_EPCFG + 0x14);
++	printf("FUXI ATH12K: BAR0 assigned %#llx readback %#x/%#x\n",
++	    (unsigned long long)candidate, rb_lo, rb_hi);
++	if ((rb_lo & ~0xfu) != (uint32_t)candidate || rb_hi != 0) {
++		wl_pwr(WL_EPCFG + 0x10, orig_lo);
++		wl_pwr(WL_EPCFG + 0x14, orig_hi);
++		printf("FUXI ATH12K: BAR0 assignment readback mismatch; link/ECAM not decoded; containment\n");
++		return 1;
++	}
++	wl_pwr(WL_EPCFG + 0x04, (cmd & 0xffffu & ~7u) | 2u);
++	uint32_t cmd_rb = wl_prd(WL_EPCFG + 0x04);
++	if (!(cmd_rb & 2u)) {
++		printf("FUXI ATH12K: BAR0 MEM enable not confirmed (cmd/status %#x); containment\n", cmd_rb);
++		return 1;
++	}
++	wla_bar0_pa = candidate;
++	wla_bar0_size = size;
++	printf("FUXI ATH12K: BAR0 allocated base %#llx size %#x MEM enable confirmed\n",
++	    (unsigned long long)wla_bar0_pa, (uint32_t)wla_bar0_size);
++	return 0;
++}
++
+ static void *
+ wla_map_phys(uint64_t address, size_t bytes)
+ {
+-	if (!bytes || address < WL_BAR0 || address - WL_BAR0 >= 0x200000 ||
+-	    bytes > 0x200000 - (address - WL_BAR0)) { return NULL; }
+-	return (void *)(fw_va(WL_BAR0) + (address - WL_BAR0));
++	if (!bytes || !wla_bar0_pa || address < wla_bar0_pa ||
++	    address - wla_bar0_pa >= wla_bar0_size ||
++	    bytes > wla_bar0_size - (address - wla_bar0_pa)) { return NULL; }
++	return (void *)(fw_va(wla_bar0_pa) + (address - wla_bar0_pa));
 +}
 +
 +/* Validate the host BAR0 window before any firmware download. Log the BAR0 PA,
@@ -413,13 +698,18 @@
 +static int
 +wla_bar0_probe(void)
 +{
-+	uintptr_t va = (uintptr_t)fw_va(WL_BAR0);
-+	printf("FUXI ATH12K: BAR0 window PA %#llx VA %p host window %#x barlen 0x200000\n",
-+	    (unsigned long long)WL_BAR0, (void *)va, WLA_BAR0_WINDOW);
-+	uint32_t hiver = wl_mrd(0x08);
-+	uint32_t hicfg = wl_mrd(0x10);
-+	wl_pwr(WL_BAR0 + 0x38, 0);
-+	uint32_t ctrl_rb = wl_mrd(0x38);
++	if (!wla_bar0_pa) {
++		printf("FUXI ATH12K: BAR0 probe skipped: no enumerated/assigned base; containment\n");
++		return 1;
++	}
++	uintptr_t va = (uintptr_t)fw_va(wla_bar0_pa);
++	printf("FUXI ATH12K: BAR0 window PA %#llx VA %p host window %#x barlen %#x\n",
++	    (unsigned long long)wla_bar0_pa, (void *)va, WLA_BAR0_WINDOW,
++	    (uint32_t)wla_bar0_size);
++	uint32_t hiver = wl_prd(wla_bar0_pa + 0x08);
++	uint32_t hicfg = wl_prd(wla_bar0_pa + 0x10);
++	wl_pwr(wla_bar0_pa + 0x38, 0);
++	uint32_t ctrl_rb = wl_prd(wla_bar0_pa + 0x38);
 +	printf("FUXI ATH12K: BAR0 write probe off 0x38 wrote 0 readback %#x MHIVER %#x MHICFG %#x\n",
 +	    ctrl_rb, hiver, hicfg);
 +	bool poison = !va || fw_faults || hiver == 0 || hiver == ~0u || (hiver >> 16) == 0xdead;
@@ -435,16 +725,16 @@
 +	    id, id & 0xffffu, id >> 16, cmd, ltssm, dbi4);
 +	printf("FUXI ATH12K: BAR0 at %#llx is not really mapped/placeholder (MHIVER %#x); "
 +	    "skip firmware download, fall back to containment\n",
-+	    (unsigned long long)WL_BAR0, hiver);
++	    (unsigned long long)wla_bar0_pa, hiver);
 +	return 1;
  }
  
  static void
-@@ -336,14 +515,28 @@
+@@ -336,14 +624,28 @@
  	if (!wla_express || !wla_msi || flags || fw_faults || !wla_available() ||
  	    wl_prd(WL_EPCFG) != 0x110717cb || (wl_prd(WL_EPCFG + 4) & 4) ||
  	    wl_mrd(wl_bhi + 0x28) != 0 || wl_disable_irqs() || wl_download_aspm()) { return 1; }
-+	if (wla_bar0_probe()) { return 1; }
++	if (wla_pcie_enumerate() || wla_bar0_probe()) { return 1; }
 +	wla_fw_probe();
  	const uint8_t *data;
  	size_t bytes;
@@ -470,7 +760,14 @@
  	}
  	uint64_t alignment = WLA_BYTES;
  	wl_iova_next = (wl_iova_next + alignment - 1) & ~(alignment - 1);
-@@ -358,17 +551,45 @@
+@@ -352,23 +654,51 @@
+ 	    fwa_init(&wla_pool, (void *)wl_ath_arena.va, wl_ath_arena.iova, WLA_BYTES, wla_blocks, WLA_BLOCKS) ||
+ 	    wl_smmu_enable() || wl_smmu_fault(18) || wl_rc_check()) { return 3; }
+ 	board = (struct nw_board){
+-		(void *)fw_va(WL_BAR0), 0x200000, 0x1107, (uint16_t)wla_msi, 1000,
++		(void *)fw_va(wla_bar0_pa), wla_bar0_size, 0x1107, (uint16_t)wla_msi, 1000,
+ 		wla_cfg_read, wla_cfg_write, wla_msi_target, wla_map_phys, 0
+ 	};
  	wl_pwr(WL_EPCFG + 4, (wl_prd(WL_EPCFG + 4) & 0xffff) | 0x406);
  	if (fw_faults || (wl_prd(WL_EPCFG + 4) & 0x406) != 0x406) { return 4; }
  	printf("FUXI ATH12K: start from PBL, full BAR, owned 128 MiB DMA, IRQ polling; legacy MHI skipped\n");
