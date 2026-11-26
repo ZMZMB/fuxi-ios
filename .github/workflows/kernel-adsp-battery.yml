@@ -190,8 +190,31 @@ jobs:
           git apply ../harness/patches/kernel-fuxi-canvas.patch
           python3 tools/sync-fuxi-unixnu.py
           if [[ "${{ inputs.ath12k }}" == "true" ]]; then
-            git apply --check ../harness/patches/kernel-ath12k-merge.patch
-            git apply ../harness/patches/kernel-ath12k-merge.patch
+            PATCH_PATH="$PWD/../harness/patches/kernel-ath12k-merge.patch"
+            echo "ath12k patch path: $PATCH_PATH"
+            ls -l "$PATCH_PATH" || true
+            wc -c "$PATCH_PATH" || true
+            head -c 120 "$PATCH_PATH" || true
+            echo
+            if [ ! -s "$PATCH_PATH" ]; then
+              echo "FATAL: ath12k patch missing or zero bytes"
+              ls -la "$(dirname "$PATCH_PATH")" || true
+              exit 1
+            fi
+            if ! grep -q '^diff --git ' "$PATCH_PATH"; then
+              echo "FATAL: ath12k patch has no 'diff --git' header"
+              exit 1
+            fi
+            set +e
+            git apply --check "$PATCH_PATH"
+            CHECK_RC=$?
+            set -e
+            echo "git apply --check rc=$CHECK_RC"
+            if [ "$CHECK_RC" -ne 0 ]; then
+              echo "FATAL: ath12k patch does not apply"
+              exit 1
+            fi
+            git apply "$PATCH_PATH"
             python3 tools/sync-fuxi-scanout.py --check
             python3 tools/sync-fuxi-wlan.py --check
             python3 tools/test-fuxi-wlan-ath12k.py --sanitize
