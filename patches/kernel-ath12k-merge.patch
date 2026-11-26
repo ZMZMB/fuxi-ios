@@ -1,9 +1,30 @@
 --- a/xnu/fuxi-scanout/SweetSurface.cpp
 +++ b/xnu/fuxi-scanout/SweetSurface.cpp
-@@ -785,6 +785,55 @@
- 	return enabled;
+@@ -746,10 +746,16 @@
  }
  
+ mach_port_name_t
+-sweet_surface_port_in_task(SweetSurface *s, task_t task)
++sweet_surface_port_in_task(SweetSurface *s, task_t task, IOReturn *retOut)
+ {
+ 	mach_port_name_t name = 0;
+-	IOUserClient::copyPortNameForObjectInTask(task, s, &name);
++	IOReturn pr = kIOReturnSuccess;
++	if (s == NULL) {
++		pr = kIOReturnBadArgument;
++	} else {
++		pr = IOUserClient::copyPortNameForObjectInTask(task, s, &name);
++	}
++	if (retOut != NULL) *retOut = pr;
+ 	return name;
+ }
+ 
+@@ -783,6 +789,55 @@
+ 		enabled = v <= 2 ? (int)v : 2;
+ 	}
+ 	return enabled;
++}
++
 +/*
 + * ath12k WLAN combination: fuxiwlan=1 and fuxiwlanath=1 (the boot that also
 + * links fuxi_ath12k.o). On this chain the GPU scanout and its CPU oracle only
@@ -51,12 +72,10 @@
 +sweet_surface_needs_convert(SweetSurface *s)
 +{
 +	return sweet_surface_convert_kind(s) != 0;
-+}
-+
+ }
+ 
  /* Geometry from the creation properties (IOSurface.h keys). */
- static IOReturn
- sweet_surface_layout(SweetSurface *s, OSDictionary *props)
-@@ -854,6 +903,14 @@
+@@ -854,6 +909,14 @@
  		s->planeCount = planes->getCount();
  	}
  
@@ -71,7 +90,7 @@
  	uint64_t alloc = sweet_dict_u32(props, "IOSurfaceAllocSize", 0);
  	if (alloc < end) {
  		alloc = end;
-@@ -949,6 +1006,7 @@
+@@ -949,6 +1012,7 @@
  	IOReturn trapLock(void *id, void *options, void *seedOut, void *, void *, void *);
  	IOReturn trapUnlock(void *id, void *options, void *seedOut, void *, void *, void *);
  	IOReturn trapRelease(void *id, void *, void *, void *, void *, void *);
@@ -79,7 +98,7 @@
  };
  
  OSDefineMetaClassAndStructors(IOSurfaceRootUserClient, IOUserClient);
-@@ -966,6 +1024,20 @@
+@@ -966,6 +1030,20 @@
  	char name[32];
  	proc_selfname(name, sizeof(name));
  	IOLog("SWEET SURF: %s %s %u\n", name, what, n);
@@ -100,7 +119,7 @@
  }
  
  bool
-@@ -1316,6 +1388,12 @@
+@@ -1316,6 +1394,12 @@
  		if (args->structureOutput != NULL) {
  			bzero(args->structureOutput, args->structureOutputSize);
  		}
@@ -113,7 +132,7 @@
  		sweet_surf_log_once("sel", selector);
  		return kIOReturnSuccess;
  	}
-@@ -1343,12 +1421,22 @@
+@@ -1343,12 +1427,22 @@
  IOReturn IOSurfaceRootUserClient::trapIncrementUse(void *id, void *category, void *, void *, void *, void *)
  {
   if ((uintptr_t)id > UINT32_MAX || (uintptr_t)category >= 2) return kIOReturnBadArgument;
@@ -138,7 +157,7 @@
  }
  
  static IOReturn
-@@ -1384,14 +1472,33 @@
+@@ -1384,14 +1478,33 @@
  IOSurfaceRootUserClient::trapLock(void *id, void *options, void *seedOut,
      void *, void *, void *)
  {
@@ -176,7 +195,7 @@
  #endif
  	IOReturn ret = sweet_surface_seed_out(s, seedOut, false);
  	s->release();
-@@ -1402,15 +1509,25 @@
+@@ -1402,15 +1515,25 @@
  IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
      void *, void *, void *)
  {
@@ -205,7 +224,7 @@
  	s->release();
  	return ret;
  }
-@@ -1425,7 +1542,19 @@
+@@ -1425,7 +1548,19 @@
  		fRefs->removeObject(index);     /* unmaps and drops the user count */
  	}
  	IOLockUnlock(fLock);
@@ -226,7 +245,7 @@
  }
  
  static IOExternalTrap sweet_surface_traps[] = {
-@@ -1437,10 +1566,22 @@
+@@ -1437,10 +1572,22 @@
  	[kSweetSurfaceTrapReleaseFailed] = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },
  };
  
@@ -265,20 +284,30 @@
  /*
   * Publish physical memory (the panel framebuffer) as a surface. Returns a
   * retained surface that stays in the id table until released by the caller
+@@ -90,7 +97,7 @@
+     uint32_t height, uint32_t bytesPerRow, uint32_t pixelFormat);
+ 
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+-mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
++mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task, IOReturn *retOut = NULL);
+ 
+ #endif /* SWEET */
+ #endif /* _SWEET_SURFACE_H */
 --- a/xnu/fuxi-unixnu/SweetFramebuffer.cpp
 +++ b/xnu/fuxi-unixnu/SweetFramebuffer.cpp
-@@ -73,6 +73,10 @@
+@@ -73,6 +73,11 @@
  #include <kern/thread_call.h>
  #include <sys/proc.h>
  
 +/* Present bookkeeping (file scope, one counter per boot; used before its old
 + * definition site, so it is declared here). */
 +static uint32_t fPresentEntries, fPresentDrops;
++static uint32_t fMaskZeroDumps;
 +
  #if defined(FUXI)
  extern bool sweet_surface_present_begin(SweetSurface **surfaces, unsigned count, uint64_t *ready, const uint64_t *epochs);
  extern void sweet_surface_present_end(void);
-@@ -658,7 +662,11 @@
+@@ -658,7 +663,11 @@
   fScanoutLog = log == 1 ? 2 : fScanout ? 1 : 0;
   if (scanout == 1 && !fScanout)
    IOLog("FUXI SCANOUT: unavailable, requires sweetfb_noconsole=1 or 2; existing present path\n");
@@ -291,7 +320,7 @@
   fuxi_gpu_scanout_configure(fPixels, fScanout, check);
   uint32_t nc = 0;
   PE_parse_boot_argn("fuxigpuncimport", &nc, sizeof(nc));
-@@ -1059,8 +1067,17 @@
+@@ -1059,8 +1068,17 @@
    SweetSurface *sources[SWEET_FB_LAYERS]; uint64_t epochs[SWEET_FB_LAYERS]; unsigned count = 0;
    uint64_t ready = candidate.swapped;
    for (unsigned i = 0; i < SWEET_FB_LAYERS; i++) if (candidate.surfaces[i]) { epochs[count] = candidate.epochs[i]; sources[count++] = candidate.surfaces[i]; }
@@ -311,7 +340,20 @@
     if (replay && fPendingCount) { replay = false; continue; }
     if (!replay && ++chosen < fPendingCount) continue;
     publishDueLocked(); IOLockUnlock(fLock); return;
-@@ -1234,6 +1251,31 @@
+@@ -1124,6 +1142,12 @@
+ #endif
+  IOLockLock(fLock);
+  uint32_t id = get32(rec, 0x50);
++ uint32_t mask = get32(rec, 0x104);
++ if (mask == 0 && fMaskZeroDumps < 32) {
++  ++fMaskZeroDumps;
++  IOLog("FUXI SCANOUT: SwapEnd mask=0 swap=%u layers=[0x%x,0x%x,0x%x,0x%x] mask=0x%x\n",
++      id, get32(rec, 0x54), get32(rec, 0x58), get32(rec, 0x5c), get32(rec, 0x60), mask);
++ }
+  SwapStatus &status = fSwapStatus[id % SWEET_FB_SWAP_HISTORY];
+  if (!id || id > fSwapID || status.id == id || status.state == SwapQueued || status.state == SwapConsumed || fScanoutHeld) {
+   IOLockUnlock(fLock); return kIOReturnNotReady;
+@@ -1234,6 +1258,31 @@
   IOLockWakeup(fLock, fSwapStatus, false);
  }
  
@@ -343,7 +385,7 @@
  bool
  AppleCLCD::present(const SwapRecord &record)
  {
-@@ -1268,15 +1310,23 @@
+@@ -1268,15 +1317,23 @@
  			continue;
  		}
  		SweetSurface *s = record.surfaces[layer]; if (s) s->retain();
@@ -367,7 +409,7 @@
  			OSSafeReleaseNULL(s);
  			continue;
  		}
-@@ -1317,13 +1367,92 @@
+@@ -1317,13 +1374,92 @@
  		if (h > (int32_t)fHeight - dy) {
  			h = (int32_t)fHeight - dy;
  		}
@@ -461,7 +503,7 @@
  			int copied = 0;
  #if defined(FUXI)
              /* Keep CPU replay complete too if a full composed crop is available. */
-@@ -1340,14 +1469,26 @@
+@@ -1340,14 +1476,26 @@
              /* fuxigpuncimport bit 24: VIG0 fetches the surface itself through a display IOVA slot; any refusal copies. */
              if (fScanout && (mask & (mask-1)) == 0) {
               int direct = sweet_surface_direct(s, src, sx, sy, w, h);
@@ -491,7 +533,7 @@
               s->release();
               return false; /* busy ring: keep the record for retry */
              }
-@@ -1368,7 +1509,9 @@
+@@ -1368,7 +1516,9 @@
               int writable = fuxi_gpu_scanout_cpu_acquire();
               if (writable != 1) {
                fScanoutHeld = writable < 0;
@@ -502,7 +544,7 @@
                s->release();
                return false;
               }
-@@ -1432,6 +1575,10 @@
+@@ -1432,6 +1582,10 @@
    completePresent(mach_absolute_time() - t0);
    if (cpuFrame) scanoutLog(false, cpuBytes, cpuTicks, 0);
   }
@@ -513,6 +555,26 @@
  #endif
   return true;
  }
+@@ -1809,10 +1963,17 @@
+ 	uint32_t outCount = 0;
+ 
+ 	switch (selector) {
+-	case kSweetFBGetLayerDefaultSurface:
+-		out[0] = sweet_surface_port_in_task(fFB->fSurface, fTask);
++	case kSweetFBGetLayerDefaultSurface: {
++		uint32_t layer = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
++		IOReturn pr = kIOReturnSuccess;
++		mach_port_name_t port = sweet_surface_port_in_task(fFB->fSurface, fTask, &pr);
++		out[0] = port;
+ 		outCount = 1;
++		IOLog("SWEET FB: sel 3 GetLayerDefaultSurface layer=%u default surface=%u port=0x%llx%s port_ret=0x%x\n",
++		    layer, fFB->fSurface ? fFB->fSurface->id : 0, (uint64_t)port,
++		    port == 0 ? " (port=0)" : "", (uint32_t)pr);
+ 		break;
++	}
+ 	case kSweetFBSwapBegin:
+ 		IOLockLock(fFB->fLock);
+ 		if (fFB->fSwapID == UINT32_MAX) ret = kIOReturnNoResources; else out[0] = ++fFB->fSwapID;
 --- a/xnu/fuxi-wlan/fuxi_wlan.c
 +++ b/xnu/fuxi-wlan/fuxi_wlan.c
 @@ -592,6 +592,7 @@
