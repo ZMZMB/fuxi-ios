@@ -1,0 +1,14 @@
+name: Build Fuxi ath12k kernel (v19 diagnostics, full RAM layout)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  kernel:
+    uses: ./.github/workflows/kernel-adsp-battery.yml
+    with:
+      ram_layout: full
+      artifact_name: fuxi-kernel-ath12k-v19diag
+      runner_label: macos-15-intel
+      ath12k: true
