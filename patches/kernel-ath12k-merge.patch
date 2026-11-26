@@ -1,0 +1,580 @@
+diff --git a/xnu/fuxi-scanout/SweetSurface.cpp b/xnu/fuxi-scanout/SweetSurface.cpp
+index f084103..e034a94 100644
+--- a/xnu/fuxi-scanout/SweetSurface.cpp
++++ b/xnu/fuxi-scanout/SweetSurface.cpp
+@@ -785,6 +785,29 @@ sweet_surface_gpu_rows(void)
+ 	return enabled;
+ }
+ 
++/*
++ * ath12k WLAN combination: fuxiwlan=1 and fuxiwlanath=1 (the boot that also
++ * links fuxi_ath12k.o). On this chain the GPU scanout and its CPU oracle only
++ * carry an 8-bit BGRA single-plane layout; a 10-bit / two-plane surface (e.g.
++ * 'b3a8') cannot be presented or copied, which stalls frames and drops to the
++ * double CPU fallback. In that combination only, refuse such layouts at the
++ * kernel surface boundary so the client falls back to the BGRA surface the
++ * scanout can present. Without both args the pre-existing acceptance is kept:
++ * single fuxiwlan, single fuxiath, and the default control boot are unchanged.
++ */
++static int
++sweet_surface_bgra_only(void)
++{
++	static int cached = -1;
++	if (cached < 0) {
++		int wlan = 0, ath = 0;
++		unsigned wlan_on = PE_parse_boot_argn("fuxiwlan", &wlan, sizeof(wlan)) && wlan > 0;
++		unsigned ath_on = PE_parse_boot_argn("fuxiwlanath", &ath, sizeof(ath)) && ath == 1;
++		cached = (wlan_on && ath_on) ? 1 : 0;
++	}
++	return cached;
++}
++
+ /* Geometry from the creation properties (IOSurface.h keys). */
+ static IOReturn
+ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+@@ -854,6 +877,15 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 		s->planeCount = planes->getCount();
+ 	}
+ 
++	if (sweet_surface_bgra_only() &&
++	    (s->pixelFormat != 0x42475241u || s->planeCount > 1 ||
++	     s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1)) {
++		IOLog("SWEET SURF: ath12k combo: refuse non-BGRA layout fmt 0x%x planes %u bpe %u ew %u eh %u (BGRA 8bpc only)\n",
++		    s->pixelFormat, s->planeCount, s->bytesPerElement,
++		    s->elementWidth, s->elementHeight);
++		return kIOReturnBadArgument;
++	}
++
+ 	uint64_t alloc = sweet_dict_u32(props, "IOSurfaceAllocSize", 0);
+ 	if (alloc < end) {
+ 		alloc = end;
+--- a/xnu/patches/0108-fuxi-gpu-scanout.patch
++++ b/xnu/patches/0108-fuxi-gpu-scanout.patch
+@@ -457,7 +457,7 @@
+  }
+  #endif
+  
+-@@ -447,6 +773,18 @@
++@@ -447,6 +773,41 @@
+  	return (uint32_t)((row + SWEET_SURFACE_ROW_ALIGN - 1) & ~(uint64_t)(SWEET_SURFACE_ROW_ALIGN - 1));
+  }
+  
+@@ -473,10 +473,33 @@
+ +	return enabled;
+ +}
+ +
+++/*
+++ * ath12k WLAN combination: fuxiwlan=1 and fuxiwlanath=1 (the boot that also
+++ * links fuxi_ath12k.o). On this chain the GPU scanout and its CPU oracle only
+++ * carry an 8-bit BGRA single-plane layout; a 10-bit / two-plane surface (e.g.
+++ * 'b3a8') cannot be presented or copied, which stalls frames and drops to the
+++ * double CPU fallback. In that combination only, refuse such layouts at the
+++ * kernel surface boundary so the client falls back to the BGRA surface the
+++ * scanout can present. Without both args the pre-existing acceptance is kept:
+++ * single fuxiwlan, single fuxiath, and the default control boot are unchanged.
+++ */
+++static int
+++sweet_surface_bgra_only(void)
+++{
+++	static int cached = -1;
+++	if (cached < 0) {
+++		int wlan = 0, ath = 0;
+++		unsigned wlan_on = PE_parse_boot_argn("fuxiwlan", &wlan, sizeof(wlan)) && wlan > 0;
+++		unsigned ath_on = PE_parse_boot_argn("fuxiwlanath", &ath, sizeof(ath)) && ath == 1;
+++		cached = (wlan_on && ath_on) ? 1 : 0;
+++	}
+++	return cached;
+++}
+++
+  /* Geometry from the creation properties (IOSurface.h keys). */
+  static IOReturn
+  sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+-@@ -470,7 +808,16 @@
++@@ -470,7 +831,16 @@
+  	if (s->bytesPerRow < (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement) {
+  		return kIOReturnBadArgument;
+  	}
+@@ -494,7 +517,23 @@
+  
+  	OSArray *planes = OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
+  	s->planeCount = 0;
+-@@ -528,6 +875,7 @@
++@@ -507,6 +877,15 @@
++ 		s->planeCount = planes->getCount();
++ 	}
++ 
+++	if (sweet_surface_bgra_only() &&
+++	    (s->pixelFormat != 0x42475241u || s->planeCount > 1 ||
+++	     s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1)) {
+++		IOLog("SWEET SURF: ath12k combo: refuse non-BGRA layout fmt 0x%x planes %u bpe %u ew %u eh %u (BGRA 8bpc only)\n",
+++		    s->pixelFormat, s->planeCount, s->bytesPerElement,
+++		    s->elementWidth, s->elementHeight);
+++		return kIOReturnBadArgument;
+++	}
+++
++ 	uint64_t alloc = sweet_dict_u32(props, "IOSurfaceAllocSize", 0);
++ 	if (alloc < end) {
++ 		alloc = end;
++@@ -528,6 +907,7 @@
+  	IOMemoryMap  *data;
+  	IOMemoryMap  *state;
+  	uint32_t      count;
+@@ -502,7 +541,7 @@
+  
+  	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+  	void free() APPLE_KEXT_OVERRIDE;
+-@@ -541,6 +889,10 @@
++@@ -541,6 +921,10 @@
+  	OSSafeReleaseNULL(data);
+  	OSSafeReleaseNULL(state);
+  	if (surface != NULL) {
+@@ -513,7 +552,7 @@
+  		sweet_surface_put(surface);
+  		surface->release();
+  		surface = NULL;
+-@@ -591,7 +943,9 @@
++@@ -591,7 +975,9 @@
+  	    void *reference) APPLE_KEXT_OVERRIDE;
+  	IOExternalTrap *getTargetAndTrapForIndex(IOService **targetP, UInt32 index) APPLE_KEXT_OVERRIDE;
+  
+@@ -524,7 +563,7 @@
+  	IOReturn trapLock(void *id, void *options, void *seedOut, void *, void *, void *);
+  	IOReturn trapUnlock(void *id, void *options, void *seedOut, void *, void *, void *);
+  	IOReturn trapRelease(void *id, void *, void *, void *, void *, void *);
+-@@ -885,6 +1239,14 @@
++@@ -885,6 +1271,14 @@
+  		    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
+  		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), ret);
+  	}
+@@ -539,7 +578,7 @@
+  	props->release();
+  	if (ret != kIOReturnSuccess) {
+  		s->release();
+-@@ -959,11 +1321,34 @@
++@@ -959,11 +1353,34 @@
+  	}
+  }
+  
+@@ -579,7 +618,7 @@
+  }
+  
+  static IOReturn
+-@@ -1004,7 +1389,7 @@
++@@ -1004,7 +1421,7 @@
+  		return kIOReturnNotFound;
+  	}
+  #if defined(FUXI)
+@@ -588,7 +627,7 @@
+    s->release(); return kIOReturnNotReady;
+   }
+  #endif
+-@@ -1044,8 +1429,8 @@
++@@ -1044,8 +1461,8 @@
+  }
+  
+  static IOExternalTrap sweet_surface_traps[] = {
+diff --git a/xnu/fuxi-wlan/fuxi_wlan_ath12k.inc b/xnu/fuxi-wlan/fuxi_wlan_ath12k.inc
+--- a/xnu/fuxi-wlan/fuxi_wlan_ath12k.inc
++++ b/xnu/fuxi-wlan/fuxi_wlan_ath12k.inc
+@@ -5,9 +5,15 @@
+ 
+ #define WLA_BYTES (128u << 20)
+ #define WLA_BLOCKS 16384u
++/* Bounded boot budgets: a stuck PBL must never hold the WLAN thread past these
++ * windows; on expiry the glue stops the module and falls back to today's
++ * containment instead of hanging boot. */
++#define WLA_ROOT_WAIT_MS 120000u
++#define WLA_READY_BUDGET_MS 20000u
+ static struct fwa_arena wla_pool;
+ static struct fwa_block *wla_blocks;
+ static unsigned wla_express, wla_msi, wla_failed;
++static bool wla_root_waited;
+ static struct {
+ 	const char *name, *file;
+ 	void *memory;
+@@ -31,6 +37,49 @@
+ wla_now_ms(void)
+ {
+ 	return wla_now_ns() / 1000000ull;
++}
++
++/* The firmware files live on the root volume; before the first open, wait for
++ * it like the legacy diagnostic path does. One wait per boot; failure is
++ * reported with the budget in milliseconds so a slow mount is distinguished
++ * from a missing image. */
++static int
++wla_wait_root(void)
++{
++	if (wla_root_waited) { return 0; }
++	uint64_t deadline = wla_now_ms() + WLA_ROOT_WAIT_MS;
++	for (;;) {
++		vnode_t root = vfs_rootvnode();
++		if (root) {
++			vnode_put(root);
++			wla_root_waited = true;
++			return 0;
++		}
++		if (wla_now_ms() >= deadline) {
++			printf("FUXI ATH12K: root volume not mounted within %u ms; firmware fetch deferred\n",
++			    WLA_ROOT_WAIT_MS);
++			return -1;
++		}
++		wl_sleep(100);
++	}
++}
++
++/* Snapshot the fault-contained MHI/BHI registers. Reads only; on a fault the
++ * caller skips the watch so an inaccessible BAR cannot be mistaken for PBL. */
++static void
++wla_mhi_snapshot(const char *phase)
++{
++	if (!wl_mhi_valid || fw_faults) { return; }
++	uint32_t ver = wl_mrd(0x08);
++	uint32_t cfg = wl_mrd(0x10);
++	uint32_t ee = wl_mrd(wl_bhi + 0x28);
++	uint32_t status = wl_mrd(0x48);
++	uint32_t ctrl = wl_mrd(0x38);
++	uint32_t bhi = wl_mrd(wl_bhi + 0x2c);
++	if (fw_faults) { return; }
++	printf("FUXI ATH12K: MHI %s MHIVER %#x MHICFG %#x EE %#x (%s) MHISTATUS %#x "
++	    "(state %s ready %u) MHICTRL %#x BHI %#x\n", phase, ver, cfg, ee,
++	    wl_mhi_ee(ee), status, wl_mhi_state((status >> 8) & 255), status & 1, ctrl, bhi);
+ }
+ 
+ static void *
+@@ -146,30 +195,43 @@
+ 		char path[128];
+ 		vnode_t file = NULL;
+ 		vfs_context_t context = vfs_context_kernel();
++		if (wla_wait_root()) { return -1; }
+ 		snprintf(path, sizeof(path), "/usr/local/share/fuxi/wlan/%s", wla_firmware[index].file);
+ 		int error = vnode_open(path, FREAD | O_NOFOLLOW | O_NONBLOCK, 0, 0, &file, context);
+-		if (error) { return -1; }
+ 		struct vnode_attr attributes;
+ 		VATTR_INIT(&attributes);
+ 		VATTR_WANTED(&attributes, va_data_size);
+-		error = vnode_getattr(file, &attributes, context);
+-		if (error || vnode_vtype(file) != VREG || !VATTR_IS_SUPPORTED(&attributes, va_data_size) ||
+-		    !attributes.va_data_size || attributes.va_data_size > WL_FW_MAX) { error = -1; }
+-		void *memory = error ? NULL : wla_alloc((size_t)attributes.va_data_size);
+-		if (!memory) { error = -1; }
++		int residual = 0;
++		uint64_t size = 0;
+ 		if (!error) {
+-			int residual = 0;
+-			error = vn_rdwr(UIO_READ, file, (caddr_t)memory, (int)attributes.va_data_size, 0,
++			error = vnode_getattr(file, &attributes, context);
++			if (!error && (vnode_vtype(file) != VREG ||
++			    !VATTR_IS_SUPPORTED(&attributes, va_data_size) ||
++			    !attributes.va_data_size || attributes.va_data_size > WL_FW_MAX)) { error = -2; }
++			size = (uint64_t)attributes.va_data_size;
++		}
++		void *memory = (!error ? wla_alloc((size_t)size) : NULL);
++		if (!memory) { error = error ? error : -3; }
++		if (!error) {
++			error = vn_rdwr(UIO_READ, file, (caddr_t)memory, (int)size, 0,
+ 			    UIO_SYSSPACE, 0, vfs_context_ucred(context), &residual, vfs_context_proc(context));
+-			if (residual) { error = -1; }
+-		}
+-		if (vnode_close(file, FREAD, context)) { error = -1; }
++			if (residual) { error = -4; }
++		}
++		int close_error = file ? vnode_close(file, FREAD, context) : 0;
+ 		if (error) {
+ 			wla_free(memory);
++			printf("FUXI ATH12K: firmware %s (%s) unavailable stage %d errno %d residual %d size %llu\n",
++			    base, wla_firmware[index].file, error, error > 0 ? error : 0, residual, size);
+ 			return -1;
+ 		}
++		if (close_error) {
++			wla_free(memory);
++			printf("FUXI ATH12K: firmware %s (%s) close failed errno %d\n", base,
++			    wla_firmware[index].file, close_error);
++			return -1;
++		}
+ 		wla_firmware[index].memory = memory;
+-		wla_firmware[index].bytes = (size_t)attributes.va_data_size;
++		wla_firmware[index].bytes = (size_t)size;
+ 		printf("FUXI ATH12K: firmware %s from %s bytes %llu\n", base,
+ 		    wla_firmware[index].file, (uint64_t)wla_firmware[index].bytes);
+ 	}
+@@ -338,12 +400,24 @@
+ 	    wl_mrd(wl_bhi + 0x28) != 0 || wl_disable_irqs() || wl_download_aspm()) { return 1; }
+ 	const uint8_t *data;
+ 	size_t bytes;
++	uint64_t fw_start = wla_now_ms();
+ 	for (unsigned attempt = 0; attempt < 1200; attempt++) {
+ 		if (!wla_fw_get("amss.bin", &data, &bytes) &&
+ 		    !wla_fw_get("m3.bin", &data, &bytes) &&
+ 		    !wla_fw_get("board-2.bin", &data, &bytes)) { break; }
+-		if (attempt == 1199) { return 2; }
++		if (attempt == 1199) {
++			printf("FUXI ATH12K: firmware cache incomplete after %llu ms; stop before module start, contain\n",
++			    (unsigned long long)(wla_now_ms() - fw_start));
++			return 2;
++		}
+ 		wl_sleep(100);
++	}
++	for (unsigned index = 0; index < sizeof(wla_firmware) / sizeof(wla_firmware[0]); index++) {
++		if (wla_firmware[index].memory) {
++			printf("FUXI ATH12K: cached firmware %s -> %s bytes %llu\n",
++			    wla_firmware[index].name, wla_firmware[index].file,
++			    (uint64_t)wla_firmware[index].bytes);
++		}
+ 	}
+ 	uint64_t alignment = WLA_BYTES;
+ 	wl_iova_next = (wl_iova_next + alignment - 1) & ~(alignment - 1);
+@@ -358,17 +432,45 @@
+ 	wl_pwr(WL_EPCFG + 4, (wl_prd(WL_EPCFG + 4) & 0xffff) | 0x406);
+ 	if (fw_faults || (wl_prd(WL_EPCFG + 4) & 0x406) != 0x406) { return 4; }
+ 	printf("FUXI ATH12K: start from PBL, full BAR, owned 128 MiB DMA, IRQ polling; legacy MHI skipped\n");
++	wla_mhi_snapshot("pre-start PBL");
+ 	nw_wifi_irq_mode(0);
+ 	int error = nw_wifi_start(&platform, &board);
+-	bool attached = false, completed = false;
++	bool attached = false, completed = false, ready_seen = false;
+ 	uint64_t started = wla_now_ms(), report = started;
+ 	unsigned spins = 0;
++	uint32_t ee_last = 0xffffffffu;
++	if (!error) { wla_mhi_snapshot("module started"); }
+ 	while (!error && !fw_faults && !wla_failed && !wla_control.error &&
+ 	    ((ios && wli.published) || wla_now_ms() - started < 90000)) {
+ 		wla_control_awake = 0;
+ 		/* nonzero while frames move: go round again without sleeping, but not for ever */
+ 		int moving = nw_wifi_step();
+ 		uint64_t now = wla_now_ms();
++		if (wl_mhi_valid && !fw_faults) {
++			uint32_t status = wl_mrd(0x48);
++			uint32_t ee = wl_mrd(wl_bhi + 0x28);
++			if (!fw_faults) {
++				bool ready = status & 1u;
++				if (ready && !ready_seen) {
++					ready_seen = true;
++					printf("FUXI ATH12K: MHI READY observed after %llu ms; state %s EE %s\n",
++					    (unsigned long long)(now - started),
++					    wl_mhi_state((status >> 8) & 255), wl_mhi_ee(ee));
++				}
++				if (ee != ee_last) {
++					printf("FUXI ATH12K: EE %#x (%s) after %llu ms\n", ee,
++					    wl_mhi_ee(ee), (unsigned long long)(now - started));
++					ee_last = ee;
++				}
++				if (!ready_seen && now - started >= WLA_READY_BUDGET_MS) {
++					printf("FUXI ATH12K: MHI READY not observed within %u ms "
++					    "(MHISTATUS %#x EE %#x); stop module, fall back to containment\n",
++					    WLA_READY_BUDGET_MS, status, ee);
++					error = -1;
++					break;
++				}
++			}
++		}
+ 		if (!attached && nw_wifi_stats.stage >= 4) {
+ 			error = nw_wifi_control_attach(ios ? &wli.session : &wla_control.session);
+ 			attached = !error;
+diff --git a/xnu/patches/0099-fuxi-wlan.patch b/xnu/patches/0099-fuxi-wlan.patch
+--- a/xnu/patches/0099-fuxi-wlan.patch
++++ b/xnu/patches/0099-fuxi-wlan.patch
+@@ -6340,7 +6340,7 @@
+ +#endif
+ --- /dev/null
+ +++ b/bsd/dev/fuxi_wlan_ath12k.inc
+-@@ -0,0 +1,434 @@
++@@ -0,0 +1,536 @@
+ +#include "fuxi_wlan_arena.h"
+ +#include "fuxi_wlan_ath12k.h"
+ +#include "fuxi_wlan_control.h"
+@@ -6348,9 +6348,15 @@
+ +
+ +#define WLA_BYTES (128u << 20)
+ +#define WLA_BLOCKS 16384u
+++/* Bounded boot budgets: a stuck PBL must never hold the WLAN thread past these
+++ * windows; on expiry the glue stops the module and falls back to today's
+++ * containment instead of hanging boot. */
+++#define WLA_ROOT_WAIT_MS 120000u
+++#define WLA_READY_BUDGET_MS 20000u
+ +static struct fwa_arena wla_pool;
+ +static struct fwa_block *wla_blocks;
+ +static unsigned wla_express, wla_msi, wla_failed;
+++static bool wla_root_waited;
+ +static struct {
+ +	const char *name, *file;
+ +	void *memory;
+@@ -6374,6 +6380,49 @@
+ +wla_now_ms(void)
+ +{
+ +	return wla_now_ns() / 1000000ull;
+++}
+++
+++/* The firmware files live on the root volume; before the first open, wait for
+++ * it like the legacy diagnostic path does. One wait per boot; failure is
+++ * reported with the budget in milliseconds so a slow mount is distinguished
+++ * from a missing image. */
+++static int
+++wla_wait_root(void)
+++{
+++	if (wla_root_waited) { return 0; }
+++	uint64_t deadline = wla_now_ms() + WLA_ROOT_WAIT_MS;
+++	for (;;) {
+++		vnode_t root = vfs_rootvnode();
+++		if (root) {
+++			vnode_put(root);
+++			wla_root_waited = true;
+++			return 0;
+++		}
+++		if (wla_now_ms() >= deadline) {
+++			printf("FUXI ATH12K: root volume not mounted within %u ms; firmware fetch deferred\n",
+++			    WLA_ROOT_WAIT_MS);
+++			return -1;
+++		}
+++		wl_sleep(100);
+++	}
+++}
+++
+++/* Snapshot the fault-contained MHI/BHI registers. Reads only; on a fault the
+++ * caller skips the watch so an inaccessible BAR cannot be mistaken for PBL. */
+++static void
+++wla_mhi_snapshot(const char *phase)
+++{
+++	if (!wl_mhi_valid || fw_faults) { return; }
+++	uint32_t ver = wl_mrd(0x08);
+++	uint32_t cfg = wl_mrd(0x10);
+++	uint32_t ee = wl_mrd(wl_bhi + 0x28);
+++	uint32_t status = wl_mrd(0x48);
+++	uint32_t ctrl = wl_mrd(0x38);
+++	uint32_t bhi = wl_mrd(wl_bhi + 0x2c);
+++	if (fw_faults) { return; }
+++	printf("FUXI ATH12K: MHI %s MHIVER %#x MHICFG %#x EE %#x (%s) MHISTATUS %#x "
+++	    "(state %s ready %u) MHICTRL %#x BHI %#x\n", phase, ver, cfg, ee,
+++	    wl_mhi_ee(ee), status, wl_mhi_state((status >> 8) & 255), status & 1, ctrl, bhi);
+ +}
+ +
+ +static void *
+@@ -6489,30 +6538,43 @@
+ +		char path[128];
+ +		vnode_t file = NULL;
+ +		vfs_context_t context = vfs_context_kernel();
+++		if (wla_wait_root()) { return -1; }
+ +		snprintf(path, sizeof(path), "/usr/local/share/fuxi/wlan/%s", wla_firmware[index].file);
+ +		int error = vnode_open(path, FREAD | O_NOFOLLOW | O_NONBLOCK, 0, 0, &file, context);
+-+		if (error) { return -1; }
+ +		struct vnode_attr attributes;
+ +		VATTR_INIT(&attributes);
+ +		VATTR_WANTED(&attributes, va_data_size);
+-+		error = vnode_getattr(file, &attributes, context);
+-+		if (error || vnode_vtype(file) != VREG || !VATTR_IS_SUPPORTED(&attributes, va_data_size) ||
+-+		    !attributes.va_data_size || attributes.va_data_size > WL_FW_MAX) { error = -1; }
+-+		void *memory = error ? NULL : wla_alloc((size_t)attributes.va_data_size);
+-+		if (!memory) { error = -1; }
+++		int residual = 0;
+++		uint64_t size = 0;
+ +		if (!error) {
+-+			int residual = 0;
+-+			error = vn_rdwr(UIO_READ, file, (caddr_t)memory, (int)attributes.va_data_size, 0,
+++			error = vnode_getattr(file, &attributes, context);
+++			if (!error && (vnode_vtype(file) != VREG ||
+++			    !VATTR_IS_SUPPORTED(&attributes, va_data_size) ||
+++			    !attributes.va_data_size || attributes.va_data_size > WL_FW_MAX)) { error = -2; }
+++			size = (uint64_t)attributes.va_data_size;
+++		}
+++		void *memory = (!error ? wla_alloc((size_t)size) : NULL);
+++		if (!memory) { error = error ? error : -3; }
+++		if (!error) {
+++			error = vn_rdwr(UIO_READ, file, (caddr_t)memory, (int)size, 0,
+ +			    UIO_SYSSPACE, 0, vfs_context_ucred(context), &residual, vfs_context_proc(context));
+-+			if (residual) { error = -1; }
+-+		}
+-+		if (vnode_close(file, FREAD, context)) { error = -1; }
+++			if (residual) { error = -4; }
+++		}
+++		int close_error = file ? vnode_close(file, FREAD, context) : 0;
+ +		if (error) {
+ +			wla_free(memory);
+++			printf("FUXI ATH12K: firmware %s (%s) unavailable stage %d errno %d residual %d size %llu\n",
+++			    base, wla_firmware[index].file, error, error > 0 ? error : 0, residual, size);
+ +			return -1;
+ +		}
+++		if (close_error) {
+++			wla_free(memory);
+++			printf("FUXI ATH12K: firmware %s (%s) close failed errno %d\n", base,
+++			    wla_firmware[index].file, close_error);
+++			return -1;
+++		}
+ +		wla_firmware[index].memory = memory;
+-+		wla_firmware[index].bytes = (size_t)attributes.va_data_size;
+++		wla_firmware[index].bytes = (size_t)size;
+ +		printf("FUXI ATH12K: firmware %s from %s bytes %llu\n", base,
+ +		    wla_firmware[index].file, (uint64_t)wla_firmware[index].bytes);
+ +	}
+@@ -6681,12 +6743,24 @@
+ +	    wl_mrd(wl_bhi + 0x28) != 0 || wl_disable_irqs() || wl_download_aspm()) { return 1; }
+ +	const uint8_t *data;
+ +	size_t bytes;
+++	uint64_t fw_start = wla_now_ms();
+ +	for (unsigned attempt = 0; attempt < 1200; attempt++) {
+ +		if (!wla_fw_get("amss.bin", &data, &bytes) &&
+ +		    !wla_fw_get("m3.bin", &data, &bytes) &&
+ +		    !wla_fw_get("board-2.bin", &data, &bytes)) { break; }
+-+		if (attempt == 1199) { return 2; }
+++		if (attempt == 1199) {
+++			printf("FUXI ATH12K: firmware cache incomplete after %llu ms; stop before module start, contain\n",
+++			    (unsigned long long)(wla_now_ms() - fw_start));
+++			return 2;
+++		}
+ +		wl_sleep(100);
+++	}
+++	for (unsigned index = 0; index < sizeof(wla_firmware) / sizeof(wla_firmware[0]); index++) {
+++		if (wla_firmware[index].memory) {
+++			printf("FUXI ATH12K: cached firmware %s -> %s bytes %llu\n",
+++			    wla_firmware[index].name, wla_firmware[index].file,
+++			    (uint64_t)wla_firmware[index].bytes);
+++		}
+ +	}
+ +	uint64_t alignment = WLA_BYTES;
+ +	wl_iova_next = (wl_iova_next + alignment - 1) & ~(alignment - 1);
+@@ -6701,17 +6775,45 @@
+ +	wl_pwr(WL_EPCFG + 4, (wl_prd(WL_EPCFG + 4) & 0xffff) | 0x406);
+ +	if (fw_faults || (wl_prd(WL_EPCFG + 4) & 0x406) != 0x406) { return 4; }
+ +	printf("FUXI ATH12K: start from PBL, full BAR, owned 128 MiB DMA, IRQ polling; legacy MHI skipped\n");
+++	wla_mhi_snapshot("pre-start PBL");
+ +	nw_wifi_irq_mode(0);
+ +	int error = nw_wifi_start(&platform, &board);
+-+	bool attached = false, completed = false;
+++	bool attached = false, completed = false, ready_seen = false;
+ +	uint64_t started = wla_now_ms(), report = started;
+ +	unsigned spins = 0;
+++	uint32_t ee_last = 0xffffffffu;
+++	if (!error) { wla_mhi_snapshot("module started"); }
+ +	while (!error && !fw_faults && !wla_failed && !wla_control.error &&
+ +	    ((ios && wli.published) || wla_now_ms() - started < 90000)) {
+ +		wla_control_awake = 0;
+ +		/* nonzero while frames move: go round again without sleeping, but not for ever */
+ +		int moving = nw_wifi_step();
+ +		uint64_t now = wla_now_ms();
+++		if (wl_mhi_valid && !fw_faults) {
+++			uint32_t status = wl_mrd(0x48);
+++			uint32_t ee = wl_mrd(wl_bhi + 0x28);
+++			if (!fw_faults) {
+++				bool ready = status & 1u;
+++				if (ready && !ready_seen) {
+++					ready_seen = true;
+++					printf("FUXI ATH12K: MHI READY observed after %llu ms; state %s EE %s\n",
+++					    (unsigned long long)(now - started),
+++					    wl_mhi_state((status >> 8) & 255), wl_mhi_ee(ee));
+++				}
+++				if (ee != ee_last) {
+++					printf("FUXI ATH12K: EE %#x (%s) after %llu ms\n", ee,
+++					    wl_mhi_ee(ee), (unsigned long long)(now - started));
+++					ee_last = ee;
+++				}
+++				if (!ready_seen && now - started >= WLA_READY_BUDGET_MS) {
+++					printf("FUXI ATH12K: MHI READY not observed within %u ms "
+++					    "(MHISTATUS %#x EE %#x); stop module, fall back to containment\n",
+++					    WLA_READY_BUDGET_MS, status, ee);
+++					error = -1;
+++					break;
+++				}
+++			}
+++		}
+ +		if (!attached && nw_wifi_stats.stage >= 4) {
+ +			error = nw_wifi_control_attach(ios ? &wli.session : &wla_control.session);
+ +			attached = !error;

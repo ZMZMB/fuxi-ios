@@ -189,6 +189,14 @@ jobs:
           git apply --check ../harness/patches/kernel-fuxi-canvas.patch
           git apply ../harness/patches/kernel-fuxi-canvas.patch
           python3 tools/sync-fuxi-unixnu.py
+          if [[ "${{ inputs.ath12k }}" == "true" ]]; then
+            git apply --check ../harness/patches/kernel-ath12k-merge.patch
+            git apply ../harness/patches/kernel-ath12k-merge.patch
+            python3 tools/sync-fuxi-scanout.py --check
+            python3 tools/sync-fuxi-wlan.py --check
+            python3 tools/test-fuxi-wlan-ath12k.py --sanitize
+            python3 tools/test-fuxi-wlan-ios.py
+          fi
           xcodebuild -version
           if bash tools/ci/build.sh kernel-metal4 > kernel-console.log 2>&1; then
             echo 'Kernel build and audit passed; complete output is in the artifact logs/build.log.'
