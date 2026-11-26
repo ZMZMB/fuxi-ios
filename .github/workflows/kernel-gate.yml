@@ -50,6 +50,7 @@ jobs:
           python3 harness/tests/test-surfrow-mode2.py source
           python3 harness/tests/test-perf-governor.py source
           python3 harness/tests/test-ib-profile.py source
+          python3 harness/tests/test-backlight-dsi.py source
           python3 source/tools/sync-fuxi-perf.py --check
       - name: Source gates (same python checks the kernel job runs)
         shell: bash
@@ -98,7 +99,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 harness/tools/gate-fast.py harness source
+          python3 harness/tools/gate-fast.py harness source harness/patches/kernel-ath12k-merge.patch
       - name: Report
         if: always()
         shell: bash
