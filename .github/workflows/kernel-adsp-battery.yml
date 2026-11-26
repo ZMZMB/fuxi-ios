@@ -215,7 +215,11 @@ jobs:
               exit 1
             fi
             git apply "$PATCH_PATH"
+            python3 tools/sync-fuxi-scanout.py
+            python3 tools/sync-fuxi-unixnu.py
+            python3 tools/sync-fuxi-wlan.py
             python3 tools/sync-fuxi-scanout.py --check
+            python3 tools/sync-fuxi-unixnu.py --check
             python3 tools/sync-fuxi-wlan.py --check
             python3 tools/test-fuxi-wlan-ath12k.py --sanitize
             python3 tools/test-fuxi-wlan-ios.py
