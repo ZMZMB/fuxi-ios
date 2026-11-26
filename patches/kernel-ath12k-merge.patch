@@ -56,21 +56,199 @@
  /* Geometry from the creation properties (IOSurface.h keys). */
  static IOReturn
  sweet_surface_layout(SweetSurface *s, OSDictionary *props)
-@@ -852,6 +901,14 @@
- 			}
- 		}
+@@ -854,6 +903,14 @@
  		s->planeCount = planes->getCount();
-+	}
-+
+ 	}
+ 
 +	if (sweet_surface_combo_active() &&
 +	    (s->pixelFormat != 0x42475241u || s->planeCount > 1 ||
 +	     s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1)) {
 +		IOLog("SWEET SURF: ath12k combo: accept non-BGRA layout fmt 0x%x planes %u bpe %u ew %u eh %u, CPU unpack to BGRA8\n",
 +		    s->pixelFormat, s->planeCount, s->bytesPerElement,
 +		    s->elementWidth, s->elementHeight);
- 	}
- 
++	}
++
  	uint64_t alloc = sweet_dict_u32(props, "IOSurfaceAllocSize", 0);
+ 	if (alloc < end) {
+ 		alloc = end;
+@@ -949,6 +1006,7 @@
+ 	IOReturn trapLock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapUnlock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapRelease(void *id, void *, void *, void *, void *, void *);
++	IOReturn trapNoop(void *, void *, void *, void *, void *, void *);
+ };
+ 
+ OSDefineMetaClassAndStructors(IOSurfaceRootUserClient, IOUserClient);
+@@ -966,6 +1024,20 @@
+ 	char name[32];
+ 	proc_selfname(name, sizeof(name));
+ 	IOLog("SWEET SURF: %s %s %u\n", name, what, n);
++}
++
++/* Failure / degraded trap line, kept distinct from the once-per-index success
++ * survey so a rejecting trap is visible with its arguments on the next boot. */
++static uint32_t sweet_surf_trap_fails;
++static void
++sweet_surf_trap_log(uint32_t index, uintptr_t id, uintptr_t options, IOReturn ret, const char *note)
++{
++	if (sweet_surf_trap_fails++ >= 128) return;
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	IOLog("SWEET SURF: %s trap %u id 0x%llx options 0x%llx ret 0x%x%s%s\n",
++	    name, index, (uint64_t)id, (uint64_t)options, (uint32_t)ret,
++	    note ? " note=" : "", note ? note : "");
+ }
+ 
+ bool
+@@ -1316,6 +1388,12 @@
+ 		if (args->structureOutput != NULL) {
+ 			bzero(args->structureOutput, args->structureOutputSize);
+ 		}
++		if (selector < 48 && !(sweet_surf_logged & (1ULL << selector))) {
++			char name[32];
++			proc_selfname(name, sizeof(name));
++			IOLog("SWEET SURF: %s sel %u arg0 0x%llx (accepted, ignored)\n",
++			    name, selector, (uint64_t)arg0);
++		}
+ 		sweet_surf_log_once("sel", selector);
+ 		return kIOReturnSuccess;
+ 	}
+@@ -1343,12 +1421,22 @@
+ IOReturn IOSurfaceRootUserClient::trapIncrementUse(void *id, void *category, void *, void *, void *, void *)
+ {
+  if ((uintptr_t)id > UINT32_MAX || (uintptr_t)category >= 2) return kIOReturnBadArgument;
+- return useCount((uint32_t)(uintptr_t)id, (uint32_t)(uintptr_t)category, true);
++ IOReturn ret = useCount((uint32_t)(uintptr_t)id, (uint32_t)(uintptr_t)category, true);
++ if (ret != kIOReturnSuccess && sweet_surface_combo_active()) {
++  sweet_surf_trap_log(kSweetSurfaceTrapIncrementUse, (uintptr_t)id, (uintptr_t)category, ret, "use-count degraded to success");
++  return kIOReturnSuccess;
++ }
++ return ret;
+ }
+ IOReturn IOSurfaceRootUserClient::trapDecrementUse(void *id, void *category, void *, void *, void *, void *)
+ {
+  if ((uintptr_t)id > UINT32_MAX || (uintptr_t)category >= 2) return kIOReturnBadArgument;
+- return useCount((uint32_t)(uintptr_t)id, (uint32_t)(uintptr_t)category, false);
++ IOReturn ret = useCount((uint32_t)(uintptr_t)id, (uint32_t)(uintptr_t)category, false);
++ if (ret != kIOReturnSuccess && sweet_surface_combo_active()) {
++  sweet_surf_trap_log(kSweetSurfaceTrapDecrementUse, (uintptr_t)id, (uintptr_t)category, ret, "use-count degraded to success");
++  return kIOReturnSuccess;
++ }
++ return ret;
+ }
+ 
+ static IOReturn
+@@ -1384,14 +1472,33 @@
+ IOSurfaceRootUserClient::trapLock(void *id, void *options, void *seedOut,
+     void *, void *, void *)
+ {
+-	SweetSurface *s = sweet_surface_held(fLock, fRefs, (uint32_t)(uintptr_t)id);
++	uint32_t sid = (uint32_t)(uintptr_t)id;
++	bool combo = sweet_surface_combo_active();
++	SweetSurface *s = sweet_surface_held(fLock, fRefs, sid);
+ 	if (s == NULL) {
++		if (combo) {
++			sweet_surf_trap_log(kSweetSurfaceTrapLock, (uintptr_t)id, (uintptr_t)options,
++			    kIOReturnNotFound, "lock: held surface missing, degraded to success");
++			return kIOReturnSuccess;
++		}
+ 		return kIOReturnNotFound;
+ 	}
+ #if defined(FUXI)
+- if (!((uintptr_t)options & kIOSurfaceLockReadOnly) && !sweet_gpu_writer(s, true, ((uintptr_t)options & kIOSurfaceLockAvoidSync) != 0)) {
+-  s->release(); return kIOReturnNotReady;
+- }
++	bool readonly = ((uintptr_t)options & kIOSurfaceLockReadOnly) != 0;
++	if (!readonly && !sweet_gpu_writer(s, true, ((uintptr_t)options & kIOSurfaceLockAvoidSync) != 0)) {
++		if (!combo) {
++			s->release();
++			return kIOReturnNotReady;
++		}
++		/* ath12k combo: the GPU writer fence cannot be satisfied here. Accept the
++		 * lock anyway (CPU present path owns the pixels) and answer the seed; do
++		 * not surface NotReady to the renderer, which abandons the frame. */
++		sweet_surf_trap_log(kSweetSurfaceTrapLock, (uintptr_t)id, (uintptr_t)options,
++		    kIOReturnNotReady, "lock: writer gate refused, degraded to success");
++		IOReturn ret = sweet_surface_seed_out(s, seedOut, false);
++		s->release();
++		return ret;
++	}
+ #endif
+ 	IOReturn ret = sweet_surface_seed_out(s, seedOut, false);
+ 	s->release();
+@@ -1402,15 +1509,25 @@
+ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
+     void *, void *, void *)
+ {
+-	SweetSurface *s = sweet_surface_held(fLock, fRefs, (uint32_t)(uintptr_t)id);
++	uint32_t sid = (uint32_t)(uintptr_t)id;
++	bool combo = sweet_surface_combo_active();
++	SweetSurface *s = sweet_surface_held(fLock, fRefs, sid);
+ 	if (s == NULL) {
++		if (combo) {
++			sweet_surf_trap_log(kSweetSurfaceTrapUnlock, (uintptr_t)id, (uintptr_t)options,
++			    kIOReturnNotFound, "unlock: held surface missing, degraded to success");
++			return kIOReturnSuccess;
++		}
+ 		return kIOReturnNotFound;
+ 	}
+ #if defined(FUXI)
+- if (!((uintptr_t)options & kIOSurfaceLockReadOnly)) (void)sweet_gpu_writer(s, false);
+-#endif
++	bool readonly = ((uintptr_t)options & kIOSurfaceLockReadOnly) != 0;
++	if (!readonly) (void)sweet_gpu_writer(s, false);
++	IOReturn ret = sweet_surface_seed_out(s, seedOut, !readonly);
++#else
+ 	IOReturn ret = sweet_surface_seed_out(s, seedOut,
+ 	    !((uintptr_t)options & kIOSurfaceLockReadOnly));
++#endif
+ 	s->release();
+ 	return ret;
+ }
+@@ -1425,7 +1542,19 @@
+ 		fRefs->removeObject(index);     /* unmaps and drops the user count */
+ 	}
+ 	IOLockUnlock(fLock);
+-	return ref != NULL ? kIOReturnSuccess : kIOReturnNotFound;
++	if (ref != NULL) return kIOReturnSuccess;
++	if (sweet_surface_combo_active()) {
++		sweet_surf_trap_log(kSweetSurfaceTrapRelease, (uintptr_t)id, 0,
++		    kIOReturnNotFound, "release: unknown surface, degraded to success");
++		return kIOReturnSuccess;
++	}
++	return kIOReturnNotFound;
++}
++
++IOReturn
++IOSurfaceRootUserClient::trapNoop(void *, void *, void *, void *, void *, void *)
++{
++	return kIOReturnSuccess;
+ }
+ 
+ static IOExternalTrap sweet_surface_traps[] = {
+@@ -1437,10 +1566,22 @@
+ 	[kSweetSurfaceTrapReleaseFailed] = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },
+ };
+ 
++static IOExternalTrap sweet_surface_trap_noop = {
++	NULL, (IOTrap) &IOSurfaceRootUserClient::trapNoop
++};
++
+ IOExternalTrap *
+ IOSurfaceRootUserClient::getTargetAndTrapForIndex(IOService **targetP, UInt32 index)
+ {
+ 	if (index >= sizeof(sweet_surface_traps) / sizeof(sweet_surface_traps[0])) {
++		if (sweet_surface_combo_active()) {
++			/* ath12k combo: an unmapped trap must not surface as a failed
++			 * lookup; answer a no-op success trap and log the index once. */
++			sweet_surf_log_once("trap", index);
++			sweet_surf_trap_log(index, 0, 0, kIOReturnSuccess, "unmapped trap, no-op success");
++			*targetP = this;
++			return &sweet_surface_trap_noop;
++		}
+ 		sweet_surf_log_once("trap", index);
+ 		return NULL;
+ 	}
 --- a/xnu/fuxi-scanout/SweetSurface.h
 +++ b/xnu/fuxi-scanout/SweetSurface.h
 @@ -81,6 +81,13 @@
@@ -335,6 +513,39 @@
  #endif
   return true;
  }
+--- a/xnu/fuxi-wlan/fuxi_wlan.c
++++ b/xnu/fuxi-wlan/fuxi_wlan.c
+@@ -592,6 +592,7 @@
+ #define WL_BAR0_END 0x605fffffu
+ #define WL_EPCFG    0x60100000ull
+ static uint32_t wl4_report[64];
++static bool wl_ath_enabled;	/* forward declaration; ath12k run path gates legacy steps */
+ 
+ static const char *
+ wl_mhi_state(uint32_t s)
+@@ -659,6 +660,14 @@
+ 		    m3[88] != 0xffffffffu) {
+ 			printf("FUXI WLAN: BAR0 readback %#x/%#x unexpected; not assigning\n", rb, m3[88]);
+ 			return 1;
++		}
++		if (wl_ath_enabled) {
++			/* ath12k glue owns BAR0: its config-space enumeration sizes the
++			 * BAR, allocates the base, verifies readback and sets MEM enable.
++			 * The legacy constant 0x60400000 must not be written here. */
++			printf("FUXI WLAN: legacy BAR0 path skipped: enumeration owns BAR0 (size %#x)\n",
++			    size);
++			return 0;
+ 		}
+ 		uint32_t cmd = wl_prd(WL_EPCFG + 0x04);
+ 		r[13] = cmd;
+@@ -736,7 +745,6 @@
+ static struct wl_dma wl_image, wl_vectors, wl_contexts, wl_tables;
+ static struct wl_dma wl_amss; /* full file when BHI uses a separate prefix */
+ static struct wl_dma wl_ath_arena;
+-static bool wl_ath_enabled;
+ static void wl_ath_release(void);
+ static bool wl_qrtr, wl_w12, wl_w13, wl_w14, wl_w15, wl_w11_attempted, wl_w11_ok;
+ static unsigned wl15_variant, wl16_variant, wl12_mlo_variant;
 --- a/xnu/fuxi-wlan/fuxi_wlan_ath12k.inc
 +++ b/xnu/fuxi-wlan/fuxi_wlan_ath12k.inc
 @@ -5,18 +5,41 @@
@@ -356,7 +567,7 @@
 +#define WLA_DBI_PA 0x60000000ull
 +#define WLA_BAR0_WINDOW 0x4000u
 +/* Expected WCN7850 PCI identifiers. */
-+#define WLA_PCI_VENDOR 0x17cdu
++#define WLA_PCI_VENDOR 0x17cbu
 +#define WLA_PCI_DEVICE 0x1107u
  static struct fwa_arena wla_pool;
  static struct fwa_block *wla_blocks;
@@ -588,7 +799,7 @@
  	}
  	*data = wla_firmware[index].memory;
  	*bytes = wla_firmware[index].bytes;
-@@ -222,12 +374,148 @@
+@@ -222,12 +374,150 @@
  	return 0;
  }
  
@@ -614,8 +825,10 @@
 +	    (unsigned long long)WL_EPCFG, bus, dev, fn, id, vendor, device,
 +	    class_code, htype);
 +	if (fw_faults || vendor != WLA_PCI_VENDOR || device != WLA_PCI_DEVICE) {
-+		printf("FUXI ATH12K: PCIe enum: no WCN7850 (expected vendor %#x device %#x); "
-+		    "fall back to containment\n", WLA_PCI_VENDOR, WLA_PCI_DEVICE);
++		printf("FUXI ATH12K: PCIe enum: no WCN7850 (expected vendor %#x device %#x class %#x; "
++		    "actual vendor %#x device %#x class %#x header %#x); fall back to containment\n",
++		    WLA_PCI_VENDOR, WLA_PCI_DEVICE, 0x280u,
++		    vendor, device, class_code, htype);
 +		return 1;
 +	}
 +	/* BAR0 sizing: clear MEM decode, write all ones, read back, restore the
@@ -740,7 +953,7 @@
  }
  
  static void
-@@ -336,14 +624,28 @@
+@@ -336,14 +626,28 @@
  	if (!wla_express || !wla_msi || flags || fw_faults || !wla_available() ||
  	    wl_prd(WL_EPCFG) != 0x110717cb || (wl_prd(WL_EPCFG + 4) & 4) ||
  	    wl_mrd(wl_bhi + 0x28) != 0 || wl_disable_irqs() || wl_download_aspm()) { return 1; }
@@ -770,7 +983,7 @@
  	}
  	uint64_t alignment = WLA_BYTES;
  	wl_iova_next = (wl_iova_next + alignment - 1) & ~(alignment - 1);
-@@ -352,23 +654,51 @@
+@@ -352,23 +656,51 @@
  	    fwa_init(&wla_pool, (void *)wl_ath_arena.va, wl_ath_arena.iova, WLA_BYTES, wla_blocks, WLA_BLOCKS) ||
  	    wl_smmu_enable() || wl_smmu_fault(18) || wl_rc_check()) { return 3; }
  	board = (struct nw_board){
