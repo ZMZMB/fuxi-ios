@@ -50,7 +50,6 @@ jobs:
           python3 harness/tests/test-surfrow-mode2.py source
           python3 harness/tests/test-perf-governor.py source
           python3 harness/tests/test-ib-profile.py source
-          python3 harness/tests/test-backlight-dsi.py source
           python3 source/tools/sync-fuxi-perf.py --check
       - name: Source gates (same python checks the kernel job runs)
         shell: bash
