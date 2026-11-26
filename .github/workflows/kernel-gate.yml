@@ -1,0 +1,106 @@
+name: Fast gate (apply chain + source gates)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out public test harness
+        uses: actions/checkout@v4
+        with:
+          path: harness
+          persist-credentials: false
+      - name: Fetch pinned source and apply the patch chain
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init -q source
+          git -C source remote add origin https://github.com/zgl97/ios-fuxi.git
+          git -C source fetch --no-tags --depth=1 origin 979e2f08c704677bb75934ae96d4686ba9d1692b
+          git -C source checkout --detach FETCH_HEAD
+          test "$(git -C source rev-parse HEAD)" = 979e2f08c704677bb75934ae96d4686ba9d1692b
+          apply_one() {
+            git -C source apply --check "../harness/patches/$1"
+            git -C source apply "../harness/patches/$1"
+          }
+          apply_one kernel-surface-stride.patch
+          apply_one kernel-bo-slots.patch
+          apply_one kernel-surfrow-mode2.patch
+          apply_one kernel-perf-governor.patch
+          apply_one kernel-ib-profile.patch
+          apply_one kernel-perf-wide.patch
+          apply_one kernel-prof-live.patch
+          apply_one kernel-prof-inclusive.patch
+          apply_one kernel-swipe-pacing.patch
+          apply_one kernel-prof-inclusive-wait.patch
+          apply_one kernel-prof-edges.patch
+          apply_one kernel-taps-presets.patch
+          apply_one kernel-input-fixes.patch
+          apply_one kernel-taps-page2.patch
+          apply_one kernel-ibprof-draws.patch
+          apply_one kernel-taps-page1.patch
+          apply_one kernel-backlight-dsi.patch
+          apply_one kernel-adsp-battery.patch
+          python3 harness/tests/test-surface-plane-result.py source
+          python3 harness/tests/test-bo-slots.py source
+          python3 harness/tests/test-surfrow-mode2.py source
+          python3 harness/tests/test-perf-governor.py source
+          python3 harness/tests/test-ib-profile.py source
+          python3 harness/tests/test-backlight-dsi.py source
+          python3 source/tools/sync-fuxi-perf.py --check
+      - name: Source gates (same python checks the kernel job runs)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          python3 tools/sync-fuxi-adsp.py --check
+          python3 tools/sync-fuxi-unixnu.py --check
+          python3 tools/sync-fuxi-backlight.py --check
+          python3 tools/test-fuxi-prof.py
+          python3 tools/test-fuxi-ram9g.py
+          python3 tools/test-fuxi-ram-sku.py
+          python3 tools/sync-fuxi-wlan.py --check
+          python3 tools/test-fuxi-rpmh-shared.py
+          python3 tools/sync-fuxi-scanout.py --check
+          python3 tools/sync-fuxi-adreno-shared.py --check
+          python3 tools/sync-fuxi-metal.py --check
+          CC=gcc python3 tools/test-fuxi-wlan-ath12k.py --sanitize
+          CC=gcc python3 tools/test-fuxi-wlan-ios.py
+          CC=gcc python3 tools/test-fuxi-wlan-m6i.py
+          CC=gcc python3 tools/test-fuxi-wlan-rails.py
+          CC=gcc python3 tools/test-fuxi-wlan-w18.py
+      - name: Apply canvas then the ath12k patch exactly as the build job does
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          git apply --check ../harness/patches/kernel-fuxi-canvas.patch
+          git apply ../harness/patches/kernel-fuxi-canvas.patch
+          python3 tools/sync-fuxi-unixnu.py
+          PATCH_PATH=../harness/patches/kernel-ath12k-merge.patch
+          ls -l "$PATCH_PATH"
+          wc -c "$PATCH_PATH"
+          head -c 120 "$PATCH_PATH"; echo
+          test -s "$PATCH_PATH"
+          grep -q -E '^(diff --git |--- a/)' "$PATCH_PATH"
+          git apply --check "$PATCH_PATH"
+          git apply "$PATCH_PATH"
+          python3 tools/sync-fuxi-scanout.py
+          python3 tools/sync-fuxi-unixnu.py
+          python3 tools/sync-fuxi-wlan.py
+          python3 tools/sync-fuxi-scanout.py --check
+          python3 tools/sync-fuxi-unixnu.py --check
+          python3 tools/sync-fuxi-wlan.py --check
+      - name: Fast lint (touched files, file lists, static use-before-declaration)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 harness/tools/gate-fast.py harness source
+      - name: Report
+        if: always()
+        shell: bash
+        run: echo "gate finished"
