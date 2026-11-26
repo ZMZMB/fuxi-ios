@@ -89,7 +89,18 @@
   * retained surface that stays in the id table until released by the caller
 --- a/xnu/fuxi-unixnu/SweetFramebuffer.cpp
 +++ b/xnu/fuxi-unixnu/SweetFramebuffer.cpp
-@@ -658,7 +658,11 @@
+@@ -73,6 +73,10 @@
+ #include <kern/thread_call.h>
+ #include <sys/proc.h>
+ 
++/* Present bookkeeping (file scope, one counter per boot; used before its old
++ * definition site, so it is declared here). */
++static uint32_t fPresentEntries, fPresentDrops;
++
+ #if defined(FUXI)
+ extern bool sweet_surface_present_begin(SweetSurface **surfaces, unsigned count, uint64_t *ready, const uint64_t *epochs);
+ extern void sweet_surface_present_end(void);
+@@ -658,7 +662,11 @@
   fScanoutLog = log == 1 ? 2 : fScanout ? 1 : 0;
   if (scanout == 1 && !fScanout)
    IOLog("FUXI SCANOUT: unavailable, requires sweetfb_noconsole=1 or 2; existing present path\n");
@@ -102,7 +113,7 @@
   fuxi_gpu_scanout_configure(fPixels, fScanout, check);
   uint32_t nc = 0;
   PE_parse_boot_argn("fuxigpuncimport", &nc, sizeof(nc));
-@@ -1059,8 +1063,17 @@
+@@ -1059,8 +1067,17 @@
    SweetSurface *sources[SWEET_FB_LAYERS]; uint64_t epochs[SWEET_FB_LAYERS]; unsigned count = 0;
    uint64_t ready = candidate.swapped;
    for (unsigned i = 0; i < SWEET_FB_LAYERS; i++) if (candidate.surfaces[i]) { epochs[count] = candidate.epochs[i]; sources[count++] = candidate.surfaces[i]; }
@@ -122,7 +133,7 @@
     if (replay && fPendingCount) { replay = false; continue; }
     if (!replay && ++chosen < fPendingCount) continue;
     publishDueLocked(); IOLockUnlock(fLock); return;
-@@ -1234,6 +1247,32 @@
+@@ -1234,6 +1251,31 @@
   IOLockWakeup(fLock, fSwapStatus, false);
  }
  
@@ -150,12 +161,11 @@
 +
 +/* Convert-path bookkeeping (file scope, one counter per boot). */
 +static uint32_t fConvertFrames, fConvertFails, fConvertOnce;
-+static uint32_t fPresentEntries, fPresentDrops;
 +
  bool
  AppleCLCD::present(const SwapRecord &record)
  {
-@@ -1268,15 +1307,23 @@
+@@ -1268,15 +1310,23 @@
  			continue;
  		}
  		SweetSurface *s = record.surfaces[layer]; if (s) s->retain();
@@ -179,7 +189,7 @@
  			OSSafeReleaseNULL(s);
  			continue;
  		}
-@@ -1317,13 +1364,92 @@
+@@ -1317,13 +1367,92 @@
  		if (h > (int32_t)fHeight - dy) {
  			h = (int32_t)fHeight - dy;
  		}
@@ -273,7 +283,7 @@
  			int copied = 0;
  #if defined(FUXI)
              /* Keep CPU replay complete too if a full composed crop is available. */
-@@ -1340,14 +1466,26 @@
+@@ -1340,14 +1469,26 @@
              /* fuxigpuncimport bit 24: VIG0 fetches the surface itself through a display IOVA slot; any refusal copies. */
              if (fScanout && (mask & (mask-1)) == 0) {
               int direct = sweet_surface_direct(s, src, sx, sy, w, h);
@@ -303,7 +313,7 @@
               s->release();
               return false; /* busy ring: keep the record for retry */
              }
-@@ -1368,7 +1506,9 @@
+@@ -1368,7 +1509,9 @@
               int writable = fuxi_gpu_scanout_cpu_acquire();
               if (writable != 1) {
                fScanoutHeld = writable < 0;
@@ -314,7 +324,7 @@
                s->release();
                return false;
               }
-@@ -1432,6 +1572,10 @@
+@@ -1432,6 +1575,10 @@
    completePresent(mach_absolute_time() - t0);
    if (cpuFrame) scanoutLog(false, cpuBytes, cpuTicks, 0);
   }
