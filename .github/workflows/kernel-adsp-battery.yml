@@ -201,7 +201,7 @@ jobs:
               ls -la "$(dirname "$PATCH_PATH")" || true
               exit 1
             fi
-            if ! grep -q '^diff --git ' "$PATCH_PATH"; then
+            if ! grep -q -E '^(diff --git |--- a/)' "$PATCH_PATH"; then
               echo "FATAL: ath12k patch has no 'diff --git' header"
               exit 1
             fi
