@@ -1,0 +1,659 @@
+--- a/xnu/fuxi-scanout/SweetSurface.cpp
++++ b/xnu/fuxi-scanout/SweetSurface.cpp
+@@ -746,10 +746,16 @@
+ }
+ 
+ mach_port_name_t
+-sweet_surface_port_in_task(SweetSurface *s, task_t task)
++sweet_surface_port_in_task(SweetSurface *s, task_t task, IOReturn *retOut)
+ {
+ 	mach_port_name_t name = 0;
+-	IOUserClient::copyPortNameForObjectInTask(task, s, &name);
++	IOReturn pr = kIOReturnSuccess;
++	if (s == NULL) {
++		pr = kIOReturnBadArgument;
++	} else {
++		pr = IOUserClient::copyPortNameForObjectInTask(task, s, &name);
++	}
++	if (retOut != NULL) *retOut = pr;
+ 	return name;
+ }
+ 
+@@ -783,6 +789,55 @@
+ 		enabled = v <= 2 ? (int)v : 2;
+ 	}
+ 	return enabled;
++}
++
++/*
++ * ath12k WLAN combination: fuxiwlan=1 and fuxiwlanath=1 (the boot that also
++ * links fuxi_ath12k.o). On this chain the GPU scanout and its CPU oracle only
++ * carry an 8-bit BGRA single-plane layout; a 10-bit / two-plane or packed mask
++ * surface cannot be presented raw. The surface is accepted at the kernel
++ * boundary and decompressed to BGRA8 on the CPU present path (see the convert
++ * branch in SweetFramebuffer::present). Without both args the pre-existing
++ * acceptance is kept: single fuxiwlan, single fuxiath, and the default control
++ * boot are unchanged.
++ */
++#define SWEET_FMT_BGRA8   0x42475241u  /* 'BGRA' */
++#define SWEET_FMT_B3A8    0x62336138u  /* 'b3a8' 30RGBLE_8A_BiPlanar */
++#define SWEET_FMT_LA08    0x4c413038u  /* 'LA08' packed L/A mask, bpe2 */
++
++static int
++sweet_surface_combo_active(void)
++{
++	static int cached = -1;
++	if (cached < 0) {
++		int wlan = 0, ath = 0;
++		unsigned wlan_on = PE_parse_boot_argn("fuxiwlan", &wlan, sizeof(wlan)) && wlan > 0;
++		unsigned ath_on = PE_parse_boot_argn("fuxiwlanath", &ath, sizeof(ath)) && ath == 1;
++		cached = (wlan_on && ath_on) ? 1 : 0;
++	}
++	return cached;
++}
++
++/* Convert kind for the present path; 0 = plain BGRA8 / outside the combo. */
++int
++sweet_surface_convert_kind(SweetSurface *s)
++{
++	if (!s || !sweet_surface_combo_active()) return 0;
++	if (s->pixelFormat == SWEET_FMT_BGRA8 && s->planeCount <= 1 &&
++	    s->bytesPerElement == 4 && s->elementWidth == 1 && s->elementHeight == 1)
++		return 0;
++	if (s->pixelFormat == SWEET_FMT_B3A8 && s->planeCount == 2)
++		return 1;
++	if (s->pixelFormat == SWEET_FMT_LA08 && s->planeCount <= 1 &&
++	    s->bytesPerElement == 2)
++		return 2;
++	return 3; /* recognized combo non-BGRA, but no decompressor here yet */
++}
++
++bool
++sweet_surface_needs_convert(SweetSurface *s)
++{
++	return sweet_surface_convert_kind(s) != 0;
+ }
+ 
+ /* Geometry from the creation properties (IOSurface.h keys). */
+@@ -854,6 +909,14 @@
+ 		s->planeCount = planes->getCount();
+ 	}
+ 
++	if (sweet_surface_combo_active() &&
++	    (s->pixelFormat != 0x42475241u || s->planeCount > 1 ||
++	     s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1)) {
++		IOLog("SWEET SURF: ath12k combo: accept non-BGRA layout fmt 0x%x planes %u bpe %u ew %u eh %u, CPU unpack to BGRA8\n",
++		    s->pixelFormat, s->planeCount, s->bytesPerElement,
++		    s->elementWidth, s->elementHeight);
++	}
++
+ 	uint64_t alloc = sweet_dict_u32(props, "IOSurfaceAllocSize", 0);
+ 	if (alloc < end) {
+ 		alloc = end;
+@@ -949,6 +1012,7 @@
+ 	IOReturn trapLock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapUnlock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapRelease(void *id, void *, void *, void *, void *, void *);
++	IOReturn trapNoop(void *, void *, void *, void *, void *, void *);
+ };
+ 
+ OSDefineMetaClassAndStructors(IOSurfaceRootUserClient, IOUserClient);
+@@ -966,6 +1030,20 @@
+ 	char name[32];
+ 	proc_selfname(name, sizeof(name));
+ 	IOLog("SWEET SURF: %s %s %u\n", name, what, n);
++}
++
++/* Failure / degraded trap line, kept distinct from the once-per-index success
++ * survey so a rejecting trap is visible with its arguments on the next boot. */
++static uint32_t sweet_surf_trap_fails;
++static void
++sweet_surf_trap_log(uint32_t index, uintptr_t id, uintptr_t options, IOReturn ret, const char *note)
++{
++	if (sweet_surf_trap_fails++ >= 128) return;
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	IOLog("SWEET SURF: %s trap %u id 0x%llx options 0x%llx ret 0x%x%s%s\n",
++	    name, index, (uint64_t)id, (uint64_t)options, (uint32_t)ret,
++	    note ? " note=" : "", note ? note : "");
+ }
+ 
+ bool
+@@ -1316,6 +1394,12 @@
+ 		if (args->structureOutput != NULL) {
+ 			bzero(args->structureOutput, args->structureOutputSize);
+ 		}
++		if (selector < 48 && !(sweet_surf_logged & (1ULL << selector))) {
++			char name[32];
++			proc_selfname(name, sizeof(name));
++			IOLog("SWEET SURF: %s sel %u arg0 0x%llx (accepted, ignored)\n",
++			    name, selector, (uint64_t)arg0);
++		}
+ 		sweet_surf_log_once("sel", selector);
+ 		return kIOReturnSuccess;
+ 	}
+@@ -1343,12 +1427,22 @@
+ IOReturn IOSurfaceRootUserClient::trapIncrementUse(void *id, void *category, void *, void *, void *, void *)
+ {
+  if ((uintptr_t)id > UINT32_MAX || (uintptr_t)category >= 2) return kIOReturnBadArgument;
+- return useCount((uint32_t)(uintptr_t)id, (uint32_t)(uintptr_t)category, true);
++ IOReturn ret = useCount((uint32_t)(uintptr_t)id, (uint32_t)(uintptr_t)category, true);
++ if (ret != kIOReturnSuccess && sweet_surface_combo_active()) {
++  sweet_surf_trap_log(kSweetSurfaceTrapIncrementUse, (uintptr_t)id, (uintptr_t)category, ret, "use-count degraded to success");
++  return kIOReturnSuccess;
++ }
++ return ret;
+ }
+ IOReturn IOSurfaceRootUserClient::trapDecrementUse(void *id, void *category, void *, void *, void *, void *)
+ {
+  if ((uintptr_t)id > UINT32_MAX || (uintptr_t)category >= 2) return kIOReturnBadArgument;
+- return useCount((uint32_t)(uintptr_t)id, (uint32_t)(uintptr_t)category, false);
++ IOReturn ret = useCount((uint32_t)(uintptr_t)id, (uint32_t)(uintptr_t)category, false);
++ if (ret != kIOReturnSuccess && sweet_surface_combo_active()) {
++  sweet_surf_trap_log(kSweetSurfaceTrapDecrementUse, (uintptr_t)id, (uintptr_t)category, ret, "use-count degraded to success");
++  return kIOReturnSuccess;
++ }
++ return ret;
+ }
+ 
+ static IOReturn
+@@ -1384,14 +1478,33 @@
+ IOSurfaceRootUserClient::trapLock(void *id, void *options, void *seedOut,
+     void *, void *, void *)
+ {
+-	SweetSurface *s = sweet_surface_held(fLock, fRefs, (uint32_t)(uintptr_t)id);
++	uint32_t sid = (uint32_t)(uintptr_t)id;
++	bool combo = sweet_surface_combo_active();
++	SweetSurface *s = sweet_surface_held(fLock, fRefs, sid);
+ 	if (s == NULL) {
++		if (combo) {
++			sweet_surf_trap_log(kSweetSurfaceTrapLock, (uintptr_t)id, (uintptr_t)options,
++			    kIOReturnNotFound, "lock: held surface missing, degraded to success");
++			return kIOReturnSuccess;
++		}
+ 		return kIOReturnNotFound;
+ 	}
+ #if defined(FUXI)
+- if (!((uintptr_t)options & kIOSurfaceLockReadOnly) && !sweet_gpu_writer(s, true, ((uintptr_t)options & kIOSurfaceLockAvoidSync) != 0)) {
+-  s->release(); return kIOReturnNotReady;
+- }
++	bool readonly = ((uintptr_t)options & kIOSurfaceLockReadOnly) != 0;
++	if (!readonly && !sweet_gpu_writer(s, true, ((uintptr_t)options & kIOSurfaceLockAvoidSync) != 0)) {
++		if (!combo) {
++			s->release();
++			return kIOReturnNotReady;
++		}
++		/* ath12k combo: the GPU writer fence cannot be satisfied here. Accept the
++		 * lock anyway (CPU present path owns the pixels) and answer the seed; do
++		 * not surface NotReady to the renderer, which abandons the frame. */
++		sweet_surf_trap_log(kSweetSurfaceTrapLock, (uintptr_t)id, (uintptr_t)options,
++		    kIOReturnNotReady, "lock: writer gate refused, degraded to success");
++		IOReturn ret = sweet_surface_seed_out(s, seedOut, false);
++		s->release();
++		return ret;
++	}
+ #endif
+ 	IOReturn ret = sweet_surface_seed_out(s, seedOut, false);
+ 	s->release();
+@@ -1402,15 +1515,25 @@
+ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
+     void *, void *, void *)
+ {
+-	SweetSurface *s = sweet_surface_held(fLock, fRefs, (uint32_t)(uintptr_t)id);
++	uint32_t sid = (uint32_t)(uintptr_t)id;
++	bool combo = sweet_surface_combo_active();
++	SweetSurface *s = sweet_surface_held(fLock, fRefs, sid);
+ 	if (s == NULL) {
++		if (combo) {
++			sweet_surf_trap_log(kSweetSurfaceTrapUnlock, (uintptr_t)id, (uintptr_t)options,
++			    kIOReturnNotFound, "unlock: held surface missing, degraded to success");
++			return kIOReturnSuccess;
++		}
+ 		return kIOReturnNotFound;
+ 	}
+ #if defined(FUXI)
+- if (!((uintptr_t)options & kIOSurfaceLockReadOnly)) (void)sweet_gpu_writer(s, false);
+-#endif
++	bool readonly = ((uintptr_t)options & kIOSurfaceLockReadOnly) != 0;
++	if (!readonly) (void)sweet_gpu_writer(s, false);
++	IOReturn ret = sweet_surface_seed_out(s, seedOut, !readonly);
++#else
+ 	IOReturn ret = sweet_surface_seed_out(s, seedOut,
+ 	    !((uintptr_t)options & kIOSurfaceLockReadOnly));
++#endif
+ 	s->release();
+ 	return ret;
+ }
+@@ -1425,7 +1548,19 @@
+ 		fRefs->removeObject(index);     /* unmaps and drops the user count */
+ 	}
+ 	IOLockUnlock(fLock);
+-	return ref != NULL ? kIOReturnSuccess : kIOReturnNotFound;
++	if (ref != NULL) return kIOReturnSuccess;
++	if (sweet_surface_combo_active()) {
++		sweet_surf_trap_log(kSweetSurfaceTrapRelease, (uintptr_t)id, 0,
++		    kIOReturnNotFound, "release: unknown surface, degraded to success");
++		return kIOReturnSuccess;
++	}
++	return kIOReturnNotFound;
++}
++
++IOReturn
++IOSurfaceRootUserClient::trapNoop(void *, void *, void *, void *, void *, void *)
++{
++	return kIOReturnSuccess;
+ }
+ 
+ static IOExternalTrap sweet_surface_traps[] = {
+@@ -1437,10 +1572,22 @@
+ 	[kSweetSurfaceTrapReleaseFailed] = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },
+ };
+ 
++static IOExternalTrap sweet_surface_trap_noop = {
++	NULL, (IOTrap) &IOSurfaceRootUserClient::trapNoop
++};
++
+ IOExternalTrap *
+ IOSurfaceRootUserClient::getTargetAndTrapForIndex(IOService **targetP, UInt32 index)
+ {
+ 	if (index >= sizeof(sweet_surface_traps) / sizeof(sweet_surface_traps[0])) {
++		if (sweet_surface_combo_active()) {
++			/* ath12k combo: an unmapped trap must not surface as a failed
++			 * lookup; answer a no-op success trap and log the index once. */
++			sweet_surf_log_once("trap", index);
++			sweet_surf_trap_log(index, 0, 0, kIOReturnSuccess, "unmapped trap, no-op success");
++			*targetP = this;
++			return &sweet_surface_trap_noop;
++		}
+ 		sweet_surf_log_once("trap", index);
+ 		return NULL;
+ 	}
+--- a/xnu/fuxi-scanout/SweetSurface.h
++++ b/xnu/fuxi-scanout/SweetSurface.h
+@@ -81,6 +81,13 @@
+ bool sweet_surface_display_hold(SweetSurface *);
+ void sweet_surface_display_drop(SweetSurface *);
+ 
++/* ath12k combo only: surface the scanout cannot carry raw. Convert kinds:
++ * 0 none (plain BGRA8 single-plane, or outside the combo), 1 b3a8 two-plane
++ * 10-bit, 2 LA08 bpe2 single-plane, 3 recognized but not decompressible here.
++ * sweet_surface_needs_convert() is kind != 0. */
++int  sweet_surface_convert_kind(SweetSurface *);
++bool sweet_surface_needs_convert(SweetSurface *);
++
+ /*
+  * Publish physical memory (the panel framebuffer) as a surface. Returns a
+  * retained surface that stays in the id table until released by the caller
+@@ -90,7 +97,7 @@
+     uint32_t height, uint32_t bytesPerRow, uint32_t pixelFormat);
+ 
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+-mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
++mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task, IOReturn *retOut = NULL);
+ 
+ #endif /* SWEET */
+ #endif /* _SWEET_SURFACE_H */
+--- a/xnu/fuxi-unixnu/SweetFramebuffer.cpp
++++ b/xnu/fuxi-unixnu/SweetFramebuffer.cpp
+@@ -73,6 +73,12 @@
+ #include <kern/thread_call.h>
+ #include <sys/proc.h>
+ 
++/* Present bookkeeping (file scope, one counter per boot; used before its old
++ * definition site, so it is declared here). */
++static uint32_t fPresentEntries, fPresentDrops;
++static uint32_t fMaskZeroDumps;
++static uint32_t fRecordDumpCount;
++
+ #if defined(FUXI)
+ extern bool sweet_surface_present_begin(SweetSurface **surfaces, unsigned count, uint64_t *ready, const uint64_t *epochs);
+ extern void sweet_surface_present_end(void);
+@@ -658,7 +664,11 @@
+  fScanoutLog = log == 1 ? 2 : fScanout ? 1 : 0;
+  if (scanout == 1 && !fScanout)
+   IOLog("FUXI SCANOUT: unavailable, requires sweetfb_noconsole=1 or 2; existing present path\n");
+- if (fScanout) { sweet_console_muted = 1; fConsolePaused = true; }
++ if (fScanout) {
++  sweet_console_muted = 1; fConsolePaused = true;
++  IOLog("FUXI SCANOUT: panel handed to scanout, console text released (noconsole=%d, panel 0x%llx %ux%u stride %u, default surface %u)\n",
++      quiet, (uint64_t)fPhys, fWidth, fHeight, fRowBytes, fSurface ? fSurface->id : 0);
++ }
+  fuxi_gpu_scanout_configure(fPixels, fScanout, check);
+  uint32_t nc = 0;
+  PE_parse_boot_argn("fuxigpuncimport", &nc, sizeof(nc));
+@@ -892,6 +902,76 @@
+ 	return v;
+ }
+ 
++/* v24diag: dump the SwapRecord actually consumed on the present path.
++ *   A. full 0x46c hexdump, 16 bytes/line, offset prefix.
++ *   B. nonzero 4-byte scan over the whole record (cap 64 entries per record).
++ *   C. dereference the candidate 64-bit fields at 0x00/0x08/0x18/0x20: copyin
++ *      16 bytes when readable, otherwise mark unreadable. Observation only. */
++static const uint32_t fuxi_dump_ptr_offs[4] = { 0x00, 0x08, 0x18, 0x20 };
++
++static void
++fuxi_dump_swap_record(const uint8_t *rec, uint32_t id)
++{
++	char buf[160];
++	for (uint32_t off = 0; off < SWEET_FB_SWAP_REC_SIZE; off += 16) {
++		uint32_t n = SWEET_FB_SWAP_REC_SIZE - off;
++		if (n > 16) n = 16;
++		int p = snprintf(buf, sizeof(buf), "FUXI SCANOUT: dump swap=%u off=0x%04x:", id, off);
++		for (uint32_t j = 0; j < n; j++) {
++			if (p > 0 && (size_t)p < sizeof(buf) - 4)
++				p += snprintf(buf + p, sizeof(buf) - p, " %02x", rec[off + j]);
++		}
++		IOLog("%s\n", buf);
++	}
++
++	uint32_t nz = 0;
++	for (uint32_t off = 0; off + 4 <= SWEET_FB_SWAP_REC_SIZE; off += 4) {
++		uint32_t v = get32(rec, off);
++		if (v == 0) continue;
++		if (nz < 64) {
++			IOLog("FUXI SCANOUT: dump nz swap=%u off=0x%04x val=0x%x\n", id, off, v);
++			++nz;
++		}
++	}
++
++	for (unsigned k = 0; k < 4; k++) {
++		uint32_t poff = fuxi_dump_ptr_offs[k];
++		uint64_t p = 0;
++		memcpy(&p, rec + poff, 8);
++		if (p == 0) {
++			IOLog("FUXI SCANOUT: dump ptr swap=%u off=0x%02x null\n", id, poff);
++			continue;
++		}
++		uint8_t dst[16];
++		if (copyin((user_addr_t)p, dst, sizeof(dst)) == 0) {
++			int q = snprintf(buf, sizeof(buf), "FUXI SCANOUT: dump ptr swap=%u off=0x%02x p=0x%llx:",
++			    id, poff, (uint64_t)p);
++			for (uint32_t j = 0; j < 16; j++) {
++				if (q > 0 && (size_t)q < sizeof(buf) - 4)
++					q += snprintf(buf + q, sizeof(buf) - q, " %02x", dst[j]);
++			}
++			IOLog("%s\n", buf);
++		} else {
++			IOLog("FUXI SCANOUT: dump ptr swap=%u off=0x%02x p=0x%llx unreadable\n",
++			    id, poff, (uint64_t)p);
++		}
++	}
++
++	uint32_t mask = get32(rec, 0x104);
++	IOLog("FUXI SCANOUT: dump parse swap=%u mask(0x104)=0x%x\n", id, mask);
++	for (uint32_t l = 0; l < SWEET_FB_LAYERS; l++) {
++		uint32_t sid = get32(rec, 0x54 + 4 * l);
++		const uint8_t *a = rec + 0x64 + 16 * l;
++		const uint8_t *b = rec + 0xc4 + 16 * l;
++		int32_t sx = (int32_t)get32(a, 0), sy = (int32_t)get32(a, 4);
++		int32_t sw = (int32_t)get32(a, 8), sh = (int32_t)get32(a, 12);
++		int32_t dx = (int32_t)get32(b, 0), dy = (int32_t)get32(b, 4);
++		int32_t w = (int32_t)get32(b, 8), h = (int32_t)get32(b, 12);
++		IOLog("FUXI SCANOUT: dump parse swap=%u layer=%u idoff=0x%x id=0x%x src(%d,%d %dx%d) dst(%d,%d %dx%d)\n",
++		    id, l, 0x54 + 4 * l, sid, sx, sy, sw, sh, dx, dy, w, h);
++	}
++}
++
+ static uint32_t sweet_fb_swaps_logged;
+ static uint64_t sweet_fb_swap_count;
+ 
+@@ -1059,8 +1139,17 @@
+   SweetSurface *sources[SWEET_FB_LAYERS]; uint64_t epochs[SWEET_FB_LAYERS]; unsigned count = 0;
+   uint64_t ready = candidate.swapped;
+   for (unsigned i = 0; i < SWEET_FB_LAYERS; i++) if (candidate.surfaces[i]) { epochs[count] = candidate.epochs[i]; sources[count++] = candidate.surfaces[i]; }
+-  if (fScanout && !sweet_surface_present_begin(sources, count, &ready, replay && candidate.shown ? NULL : epochs)) {
+-   fQueuedDefers++;
++  const uint64_t *beginEpochs = replay && candidate.shown ? NULL : epochs;
++  if (fScanout && !sweet_surface_present_begin(sources, count, &ready, beginEpochs)) {
++   fQueuedDefers++; ++fPresentDrops;
++   for (unsigned i = 0; i < count; i++) {
++    SweetSurface *q = sources[i];
++    const char *why = q->gpuWriters ? "writer" : q->gpuQuarantined ? "quarantine" :
++        (beginEpochs && q->gpuWriterEpoch != beginEpochs[i]) ? "epoch" : "busy";
++    IOLog("FUXI SCANOUT: present defer swap=%u surface=%u reject=%s writers=%u quar=%u epoch=%llu/%llu\n",
++        get32(candidate.bytes, 0x50), q->id, why, q->gpuWriters, q->gpuQuarantined,
++        beginEpochs ? q->gpuWriterEpoch : 0, beginEpochs ? beginEpochs[i] : 0);
++   }
+    if (replay && fPendingCount) { replay = false; continue; }
+    if (!replay && ++chosen < fPendingCount) continue;
+    publishDueLocked(); IOLockUnlock(fLock); return;
+@@ -1124,6 +1213,12 @@
+ #endif
+  IOLockLock(fLock);
+  uint32_t id = get32(rec, 0x50);
++ uint32_t mask = get32(rec, 0x104);
++ if (mask == 0 && fMaskZeroDumps < 32) {
++  ++fMaskZeroDumps;
++  IOLog("FUXI SCANOUT: SwapEnd mask=0 swap=%u layers=[0x%x,0x%x,0x%x,0x%x] mask=0x%x\n",
++      id, get32(rec, 0x54), get32(rec, 0x58), get32(rec, 0x5c), get32(rec, 0x60), mask);
++ }
+  SwapStatus &status = fSwapStatus[id % SWEET_FB_SWAP_HISTORY];
+  if (!id || id > fSwapID || status.id == id || status.state == SwapQueued || status.state == SwapConsumed || fScanoutHeld) {
+   IOLockUnlock(fLock); return kIOReturnNotReady;
+@@ -1234,6 +1329,31 @@
+  IOLockWakeup(fLock, fSwapStatus, false);
+ }
+ 
++/* 10-bit two-plane ('b3a8', kCVPixelFormatType_30RGBLE_8A_BiPlanar) -> BGRA8.
++ * Plane 0: little-endian packed 10-10-10 word (B bits 0-9, G 10-19, R 20-29,
++ * top two bits unused); plane 1: 8-bit alpha. 10->8 drops the two low bits.
++ * Channel order assumes B10G10R10; if the field is actually R/B swapped the only
++ * symptom would be red/blue exchanged, not a black panel. */
++static uint32_t
++fuxi_fb_bgra10_unpack(uint32_t word, uint8_t alpha)
++{
++	uint8_t b = (uint8_t)((word & 0x3FFu) >> 2);
++	uint8_t g = (uint8_t)(((word >> 10) & 0x3FFu) >> 2);
++	uint8_t r = (uint8_t)(((word >> 20) & 0x3FFu) >> 2);
++	return (uint32_t)b | ((uint32_t)g << 8) | ((uint32_t)r << 16) | ((uint32_t)alpha << 24);
++}
++
++/* 'LA08' packed L/A mask (bpe2) -> BGRA8. Byte 0 luminance, byte 1 alpha
++ * (little-endian 16-bit). L is replicated to R/G/B; alpha passes through. */
++static uint32_t
++fuxi_fb_la08_unpack(uint8_t lum, uint8_t alpha)
++{
++	return (uint32_t)lum | ((uint32_t)lum << 8) | ((uint32_t)lum << 16) | ((uint32_t)alpha << 24);
++}
++
++/* Convert-path bookkeeping (file scope, one counter per boot). */
++static uint32_t fConvertFrames, fConvertFails, fConvertOnce;
++
+ bool
+ AppleCLCD::present(const SwapRecord &record)
+ {
+@@ -1268,15 +1388,23 @@
+ 			continue;
+ 		}
+ 		SweetSurface *s = record.surfaces[layer]; if (s) s->retain();
++		++fPresentEntries;
+ 		if (sweet_fb_swaps_logged < 16) {
+ 			sweet_fb_swaps_logged++;
+ 			IOLog("SWEET FB: swap %u layer %u surface %u %ux%u fmt 0x%x bpr %u a %d,%d %ux%u b %d,%d %dx%d\n",
+ 			    get32(rec, 0x50), layer, id, s ? s->width : 0, s ? s->height : 0,
+ 			    s ? s->pixelFormat : 0, s ? s->bytesPerRow : 0, sx, sy, get32(a, 8),
+ 			    get32(a, 12), dx, dy, w, h);
++		} else if (fScanoutLog >= 1) {
++			IOLog("FUXI SCANOUT: present-in swap=%u layer=%u surface=%u fmt=0x%x planes=%u bpe=%u bpr=%u src=%d,%d crop=%dx%d dst=%d,%d\n",
++			    get32(rec, 0x50), layer, id, s ? s->pixelFormat : 0, s ? s->planeCount : 0,
++			    s ? s->bytesPerElement : 0, s ? s->bytesPerRow : 0, sx, sy, w, h, dx, dy);
+ 		}
+ 		if (s == NULL || s == fSurface) {
+ 			fShadowValid = false;
++			if (s == fSurface && fScanoutLog == 2)
++				IOLog("FUXI SCANOUT: present direct-to-panel swap=%u surface=%u (default surface, zero copy)\n",
++				    get32(rec, 0x50), id);
+ 			OSSafeReleaseNULL(s);
+ 			continue;
+ 		}
+@@ -1317,13 +1445,92 @@
+ 		if (h > (int32_t)fHeight - dy) {
+ 			h = (int32_t)fHeight - dy;
+ 		}
++		int ckind = sweet_surface_convert_kind(s);
++		if (ckind != 0) {
++			uint64_t dlen = s->memory ? s->memory->getLength() : 0;
++			const uint8_t *base = (const uint8_t *)(uintptr_t)src;
++			const struct sweet_surface_plane *p0 = NULL, *p1 = NULL;
++			bool ok = base != NULL && dlen > 0 && w > 0 && h > 0 &&
++			    sx + w <= (int32_t)s->width && sy + h <= (int32_t)s->height;
++			uint64_t srcEnd = 0, dstEnd = (uint64_t)(dy + h) * fRowBytes + (uint64_t)dx * 4;
++			if (ckind == 1) {
++				ok = ok && s->planeCount == 2 &&
++				    s->planes[0].bytesPerElement == 4 && s->planes[1].bytesPerElement == 1 &&
++				    s->planes[0].bytesPerRow > 0 && s->planes[1].bytesPerRow > 0 &&
++				    sx + w <= (int32_t)s->planes[0].width && sy + h <= (int32_t)s->planes[0].height;
++				if (ok) {
++					p0 = &s->planes[0]; p1 = &s->planes[1];
++					uint64_t p0end = p0->offset + (uint64_t)(sy + h - 1) * p0->bytesPerRow + (uint64_t)(sx + w) * 4;
++					uint64_t p1end = p1->offset + (uint64_t)(sy + h - 1) * p1->bytesPerRow + (uint64_t)(sx + w);
++					srcEnd = p0end > p1end ? p0end : p1end;
++				}
++			} else if (ckind == 2) {
++				ok = ok && s->planeCount <= 1 && s->bytesPerElement == 2 && s->bytesPerRow > 0;
++				if (ok) srcEnd = s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow + (uint64_t)(sx + w) * 2;
++			} else {
++				ok = false; /* kind 3: recognized combo non-BGRA, no decompressor here yet */
++			}
++			ok = ok && srcEnd <= dlen && dstEnd <= (uint64_t)fRowBytes * fHeight;
++			if (!ok) {
++				++fConvertFails; ++fPresentDrops;
++				IOLog("FUXI SCANOUT: CONVERT FAIL swap=%u surface=%u kind=%u fmt 0x%x planes %u bpe %u bpr %u p0 bpe %u bpr %u p1 bpe %u bpr %u src 0x%llx len %llu crop %d,%d %dx%d fails=%u\n",
++				    get32(rec, 0x50), s->id, ckind, s->pixelFormat, s->planeCount,
++				    s->bytesPerElement, s->bytesPerRow,
++				    s->planes[0].bytesPerElement, s->planes[0].bytesPerRow,
++				    s->planes[1].bytesPerElement, s->planes[1].bytesPerRow,
++				    (uint64_t)base, dlen, sx, sy, w, h, fConvertFails);
++				s->release();
++				continue;
++			}
++			++fConvertFrames;
++			if (fConvertOnce++ == 0)
++				IOLog("FUXI SCANOUT: CONVERT path surface %u kind=%u input fmt 0x%x planes %u bpe %u bpr %u p0 bpr %u p1 bpr %u output bpr %u crop %d,%d %dx%d frames=%u\n",
++				    s->id, ckind, s->pixelFormat, s->planeCount, s->bytesPerElement, s->bytesPerRow,
++				    p0 ? p0->bytesPerRow : 0, p1 ? p1->bytesPerRow : 0,
++				    fRowBytes, sx, sy, w, h, fConvertFrames);
++			else if (fScanoutLog == 2)
++				IOLog("FUXI SCANOUT: CONVERT frame=%u kind=%u path=CPU input fmt 0x%x planes %u output bpr %u crop %d,%d %dx%d\n",
++				    fConvertFrames, ckind, s->pixelFormat, s->planeCount, fRowBytes, sx, sy, w, h);
++			for (int32_t y = 0; y < h; y++) {
++				volatile uint32_t *out = (volatile uint32_t *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4);
++				if (ckind == 1) {
++					const uint32_t *row0 = (const uint32_t *)(base + p0->offset + (uint64_t)(sy + y) * p0->bytesPerRow);
++					const uint8_t *row1 = base + p1->offset + (uint64_t)(sy + y) * p1->bytesPerRow;
++					for (int32_t x = 0; x < w; x++) {
++						uint32_t word;
++						__builtin_memcpy(&word, row0 + sx + x, 4);
++						out[x] = fuxi_fb_bgra10_unpack(word, row1[sx + x]);
++					}
++				} else {
++					const uint8_t *row = base + s->offset + (uint64_t)(sy + y) * s->bytesPerRow;
++					for (int32_t x = 0; x < w; x++) {
++						uint8_t lum = row[(sx + x) * 2];
++						uint8_t alpha = row[(sx + x) * 2 + 1];
++						out[x] = fuxi_fb_la08_unpack(lum, alpha);
++					}
++				}
++			}
++			fShadowValid = false;
++			cpuFrame = true;
++			cpuBytes += (uint64_t)w * h * 4;
++			s->release();
++			continue;
++		}
+ 		uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
+ 		    (uint64_t)(sx + w) * 4;
+ 		if (w <= 0 || h <= 0 || s->elementWidth != 1 || s->elementHeight != 1 ||
+ 		    s->memory == NULL || last > s->memory->getLength()) {
+ 			src = 0;
+ 		}
+-		if (src != 0 && bpe == 4) {
++		if (src == 0 || bpe != 4) {
++			++fPresentDrops;
++			if (fScanoutLog == 2)
++				IOLog("FUXI SCANOUT: present drop swap=%u surface=%u reason=geometry src=0x%llx bpe=%u w=%d h=%d\n",
++				    get32(rec, 0x50), s->id, (uint64_t)src, bpe, w, h);
++			s->release();
++			continue;
++		}
++		if (bpe == 4) {
+ 			int copied = 0;
+ #if defined(FUXI)
+             /* Keep CPU replay complete too if a full composed crop is available. */
+@@ -1340,14 +1547,26 @@
+             /* fuxigpuncimport bit 24: VIG0 fetches the surface itself through a display IOVA slot; any refusal copies. */
+             if (fScanout && (mask & (mask-1)) == 0) {
+              int direct = sweet_surface_direct(s, src, sx, sy, w, h);
+-             if (direct == 3) { fStageBlocks[2]++; fScanoutDefers++; s->release(); return false; }
+-             if (direct == 2) { fShadowValid = false; s->release(); continue; }
++             if (direct == 3) {
++              fStageBlocks[2]++; fScanoutDefers++; ++fPresentDrops;
++              IOLog("FUXI SCANOUT: present defer swap=%u surface=%u reason=direct-busy\n",
++                  get32(rec, 0x50), s->id);
++              s->release(); return false;
++             }
++             if (direct == 2) {
++              fShadowValid = false; ++fPresentDrops;
++              IOLog("FUXI SCANOUT: present drop swap=%u surface=%u reason=direct-refused\n",
++                  get32(rec, 0x50), s->id);
++              s->release(); continue;
++             }
+             } else if (fScanout && fuxi_gpu_scanout_direct_on()) fuxi_gpu_scanout_direct_refused(FG_DD_LAYERS);
+ 			if ((mask & (mask-1)) == 0)
+ 				copied = sweet_surface_gpu_copy(s, src, sx, sy, dx, dy, w, h);
+             if (copied == 3 || (copied < 0 && fScanout)) {
+              fStageBlocks[2]++;
+-             fScanoutDefers++;
++             fScanoutDefers++; ++fPresentDrops;
++             IOLog("FUXI SCANOUT: present defer swap=%u surface=%u reason=gpu-copy-busy copied=%d\n",
++                 get32(rec, 0x50), s->id, copied);
+              s->release();
+              return false; /* busy ring: keep the record for retry */
+             }
+@@ -1368,7 +1587,9 @@
+              int writable = fuxi_gpu_scanout_cpu_acquire();
+              if (writable != 1) {
+               fScanoutHeld = writable < 0;
+-              fScanoutDefers++;
++              fScanoutDefers++; ++fPresentDrops;
++              IOLog("FUXI SCANOUT: present defer swap=%u surface=%u reason=cpu-held writable=%d\n",
++                  get32(rec, 0x50), s->id, writable);
+               s->release();
+               return false;
+              }
+@@ -1432,6 +1653,14 @@
+   completePresent(mach_absolute_time() - t0);
+   if (cpuFrame) scanoutLog(false, cpuBytes, cpuTicks, 0);
+  }
++ if (fConsolePaused && fRecordDumpCount < 16) {
++  ++fRecordDumpCount;
++  fuxi_dump_swap_record(rec, get32(rec, 0x50));
++ }
++ if (fScanout && fScanoutLog == 2)
++  IOLog("FUXI SCANOUT: present done swap=%u gpu=%u cpu=%u entries=%u drops=%u\n",
++      get32(rec, 0x50), gpuFrame ? 1u : 0u, cpuFrame ? 1u : 0u,
++      fPresentEntries, fPresentDrops);
+ #endif
+  return true;
+ }
+@@ -1809,10 +2038,17 @@
+ 	uint32_t outCount = 0;
+ 
+ 	switch (selector) {
+-	case kSweetFBGetLayerDefaultSurface:
+-		out[0] = sweet_surface_port_in_task(fFB->fSurface, fTask);
++	case kSweetFBGetLayerDefaultSurface: {
++		uint32_t layer = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
++		IOReturn pr = kIOReturnSuccess;
++		mach_port_name_t port = sweet_surface_port_in_task(fFB->fSurface, fTask, &pr);
++		out[0] = port;
+ 		outCount = 1;
++		IOLog("SWEET FB: sel 3 GetLayerDefaultSurface layer=%u default surface=%u port=0x%llx%s port_ret=0x%x\n",
++		    layer, fFB->fSurface ? fFB->fSurface->id : 0, (uint64_t)port,
++		    port == 0 ? " (port=0)" : "", (uint32_t)pr);
+ 		break;
++	}
+ 	case kSweetFBSwapBegin:
+ 		IOLockLock(fFB->fLock);
+ 		if (fFB->fSwapID == UINT32_MAX) ret = kIOReturnNoResources; else out[0] = ++fFB->fSwapID;
