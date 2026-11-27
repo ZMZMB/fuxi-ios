@@ -1,7 +1,1749 @@
-diff --git a/tools/ci/v13wifi-1-marker.txt b/tools/ci/v13wifi-1-marker.txt
-new file mode 100644
-index 0000000..e69de29
---- /dev/null
-+++ b/tools/ci/v13wifi-1-marker.txt
-@@ -0,0 +1 @@
-+v13wifi-1: display frozen at ci/source (85678 B, 2026-11-26 11:12:22), ath12k link enabled
+diff --git a/xnu/fuxi-wlan/fuxi_wlan.c b/xnu/fuxi-wlan/fuxi_wlan.c
+--- a/xnu/fuxi-wlan/fuxi_wlan.c
++++ b/xnu/fuxi-wlan/fuxi_wlan.c
+@@ -66,6 +66,7 @@
+ #include <sys/systm.h>
+ #include <sys/fcntl.h>
+ #include <sys/vnode.h>
++#include <sys/mount.h>
+ #include <sys/uio.h>
+ #include <sys/random.h>
+ #include <string.h>
+@@ -592,6 +593,7 @@
+ #define WL_BAR0_END 0x605fffffu
+ #define WL_EPCFG    0x60100000ull
+ static uint32_t wl4_report[64];
++static bool wl_ath_enabled;	/* forward declaration; ath12k run path gates legacy steps */
+ 
+ static const char *
+ wl_mhi_state(uint32_t s)
+@@ -605,6 +607,62 @@
+ {
+ 	static const char *n[8] = {"PBL", "SBL", "AMSS", "RDDM", "WFW", "PTHRU", "EDL", "FP"};
+ 	return e < 8 ? n[e] : "?";
++}
++
++/* v20diag: read-only PCIe cmd/status decode and link snapshot. No config
++ * writes; every access is fault-contained through wl_prd. Observations only. */
++static unsigned wl_diag_cap(uint64_t cfg, unsigned id, bool ext, uint32_t *flags);
++
++static void
++wl_diag_cmdstatus(const char *tag, uint32_t v)
++{
++	uint32_t cmd = v & 0xffffu, st = v >> 16;
++	static const struct { unsigned bit; const char *name; } cmd_bits[] = {
++	    {0, "I/O space"}, {1, "Memory space"}, {2, "Bus master"},
++	    {3, "Special cycle"}, {4, "Mem write invalidate"}, {5, "VGA palette"},
++	    {6, "Parity error"}, {7, "SERR#"}, {8, "Fast back-to-back"},
++	    {9, "Interrupt disable"}, {11, "Mem write invalidate enable"},
++	};
++	static const struct { unsigned bit; const char *name; } st_bits[] = {
++	    {2, "Interrupt status"}, {4, "Capabilities list"}, {5, "66 MHz"},
++	    {7, "Fast back-to-back"}, {8, "Parity error detected"},
++	    {11, "Signaled target abort"}, {12, "Received target abort"},
++	    {13, "Received master abort"}, {14, "Signaled system error"},
++	    {15, "Detected parity error"},
++	};
++	printf("FUXI WLAN: %s cmd/status %#x: command %#x", tag, v, cmd);
++	for (unsigned i = 0; i < sizeof(cmd_bits) / sizeof(cmd_bits[0]); i++) {
++		if (cmd & (1u << cmd_bits[i].bit)) { printf(" [%s]", cmd_bits[i].name); }
++	}
++	printf("; status %#x", st);
++	for (unsigned i = 0; i < sizeof(st_bits) / sizeof(st_bits[0]); i++) {
++		if (st & (1u << st_bits[i].bit)) { printf(" [%s]", st_bits[i].name); }
++	}
++	printf("\n");
++}
++
++/* Link snapshot at the legacy failure point. Offsets follow the existing
++ * glue: RC PCIe cap via wl_diag_cap(WL_DBI, 0x10), LNKCTL/STA at cap+0x10;
++ * LTSSM at WL_PARF+0x1b0; PERST on TLMM gpio94 data+4; EP PM cap id 1,
++ * PMCSR at cap+4; RC/EP cmd/status at config +0x04. */
++static void
++wl_diag_link_note(const char *tag)
++{
++	uint32_t flags = 0;
++	unsigned rc_cap = wl_diag_cap(WL_DBI, 0x10, false, &flags);
++	uint32_t rc_lnk = rc_cap ? wl_prd(WL_DBI + rc_cap + 0x10) : ~0u;
++	uint32_t ltssm = wl_prd(WL_PARF + 0x1b0);
++	uint32_t perst = wl_prd(TS_TLMM + 0x1000ull * 94 + 4);
++	uint32_t ep_id = wl_prd(WL_EPCFG);
++	unsigned ep_pm = (ep_id != ~0u && ep_id != 0) ? wl_diag_cap(WL_EPCFG, 1, false, &flags) : 0;
++	uint32_t pmcsr = ep_pm ? wl_prd(WL_EPCFG + ep_pm + 4) : ~0u;
++	uint32_t rc_cs = wl_prd(WL_DBI + 0x04);
++	uint32_t ep_cs = wl_prd(WL_EPCFG + 0x04);
++	printf("FUXI WLAN: %s link: PARF_LTSSM %#x RC LNKCTL/STA %#x (pcie-cap %#x) "
++	    "PERST_IO %#x EP PMCSR %#x (pm-cap %#x) EP id %#x\n",
++	    tag, ltssm, rc_lnk, rc_cap, perst, pmcsr, ep_pm, ep_id);
++	wl_diag_cmdstatus("RC", rc_cs);
++	wl_diag_cmdstatus("EP", ep_cs);
+ }
+ 
+ /* 0 on success or a nonzero reason. */
+@@ -660,6 +718,14 @@
+ 			printf("FUXI WLAN: BAR0 readback %#x/%#x unexpected; not assigning\n", rb, m3[88]);
+ 			return 1;
+ 		}
++		if (wl_ath_enabled) {
++			/* ath12k glue owns BAR0: its config-space enumeration sizes the
++			 * BAR, allocates the base, verifies readback and sets MEM enable.
++			 * The legacy constant 0x60400000 must not be written here. */
++			printf("FUXI WLAN: legacy BAR0 path skipped: enumeration owns BAR0 (size %#x)\n",
++			    size);
++			return 0;
++		}
+ 		uint32_t cmd = wl_prd(WL_EPCFG + 0x04);
+ 		r[13] = cmd;
+ 		wl_pwr(WL_EPCFG + 0x04, cmd & 0xffffu & ~7u);   /* decode off while moving */
+@@ -682,10 +748,16 @@
+ 	case 16: { /* MHI + BHI, read-only */
+ 		static const uint16_t mo[10] = {0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x2c, 0x30, 0x38, 0x48};
+ 		static const uint16_t bo[8] = {0x00, 0x04, 0x28, 0x2c, 0x30, 0x34, 0x38, 0x3c};
++		printf("FUXI WLAN: step 16 entered: BAR0 window %#llx wl_ath_enabled=%d wl3_faults=%u fw_faults=%u\n",
++		    (unsigned long long)WL_BAR0, wl_ath_enabled, wl3_faults, fw_faults);
++		wl_diag_link_note("step16");
+ 		for (unsigned i = 0; i < 10; i++) {
+ 			r[20 + i] = wl_prd((uint64_t)WL_BAR0 + mo[i]);
++			printf("FUXI WLAN: step16 MHI read BAR0+%#x -> %#x\n", mo[i], r[20 + i]);
+ 		}
+ 		if (wl3_faults) {
++			printf("FUXI WLAN: step 16 exit reason 1: MMIO fault during MHI register reads "
++			    "(wl3_faults=%u fw_faults=%u)\n", wl3_faults, fw_faults);
+ 			return 1;
+ 		}
+ 		uint32_t cfg = r[22], st = r[29], ctrl = r[28], bhi = r[25];
+@@ -697,14 +769,20 @@
+ 		    ctrl, (ctrl >> 8) & 0xffu, (ctrl >> 1) & 1u, st, wl_mhi_state((st >> 8) & 0xffu),
+ 		    st & 1u, (st >> 2) & 1u);
+ 		if (r[20] == 0xffffffffu && r[21] == 0xffffffffu) {
++			printf("FUXI WLAN: step 16 exit reason 2: BAR0 not decoded / link down "
++			    "(REGLEN=%#x MHIVER=%#x both all-ones; BAR0 window %#llx unresponsive)\n",
++			    r[20], r[21], (unsigned long long)WL_BAR0);
+ 			return 2;               /* BAR not decoded / link down */
+ 		}
+ 		if (bhi < 0x40 || bhi > 0x4000u - 0x40u || (bhi & 3)) {
+ 			printf("FUXI WLAN: BHIOFF %#x outside the mapped 16 KiB; BHI not read\n", bhi);
++			printf("FUXI WLAN: step 16 exit reason 3: BHIOFF %#x invalid: range [0x40, 0x3fc0), 4-aligned\n",
++			    bhi);
+ 			return 3;
+ 		}
+ 		for (unsigned i = 0; i < 8; i++) {
+ 			r[30 + i] = wl_prd((uint64_t)WL_BAR0 + bhi + bo[i]);
++			printf("FUXI WLAN: step16 BHI read +%#x -> %#x\n", bo[i], r[30 + i]);
+ 		}
+ 		printf("FUXI WLAN: BHI version %u.%u EXECENV %#x (%s) STATUS %#x (%u) ERRCODE %#x ERRDBG %#x %#x %#x\n",
+ 		    r[31], r[30], r[32], wl_mhi_ee(r[32]), r[33], r[33] >> 30, r[34], r[35], r[36], r[37]);
+@@ -712,6 +790,14 @@
+ 		r[38] = wl_prd(WL_DBI + 0x04);
+ 		r[39] = wl_prd(WL_EPCFG + 0x04);
+ 		printf("FUXI WLAN: RC cmd/status %#x EP cmd/status %#x\n", r[38], r[39]);
++		wl_diag_cmdstatus("RC-final", r[38]);
++		wl_diag_cmdstatus("EP-final", r[39]);
++		if (wl3_faults) {
++			printf("FUXI WLAN: step 16 exit reason 4: MMIO fault after BHI reads "
++			    "(wl3_faults=%u fw_faults=%u)\n", wl3_faults, fw_faults);
++		} else {
++			printf("FUXI WLAN: step 16 exit reason 0: MHI/BHI snapshot complete (faults 0)\n");
++		}
+ 		return wl3_faults ? 4 : 0;
+ 	}
+ 	}
+@@ -736,7 +822,6 @@
+ static struct wl_dma wl_image, wl_vectors, wl_contexts, wl_tables;
+ static struct wl_dma wl_amss; /* full file when BHI uses a separate prefix */
+ static struct wl_dma wl_ath_arena;
+-static bool wl_ath_enabled;
+ static void wl_ath_release(void);
+ static bool wl_qrtr, wl_w12, wl_w13, wl_w14, wl_w15, wl_w11_attempted, wl_w11_ok;
+ static unsigned wl15_variant, wl16_variant, wl12_mlo_variant;
+@@ -2957,6 +3042,60 @@
+ 	return bad;
+ }
+ 
++/* v15fwdiag: one-shot path/root-volume decomposition, printed only after the
++ * retried firmware open still fails. Each successful vnode_lookup holds an
++ * iocount that is released with vnode_put; read-only, no state change. */
++static const char *
++wl_fwdiag_vtype(int t)
++{
++	switch (t) {
++	case VNON: return "VNON";
++	case VREG: return "VREG";
++	case VDIR: return "VDIR";
++	case VBLK: return "VBLK";
++	case VCHR: return "VCHR";
++	case VLNK: return "VLNK";
++	case VSOCK: return "VSOCK";
++	case VFIFO: return "VFIFO";
++	case VBAD: return "VBAD";
++	default: return "?";
++	}
++}
++
++static void
++wl_fw_open_diag(const char *path, vfs_context_t ctx)
++{
++	static const char *levels[] = {
++	    "/usr", "/usr/local", "/usr/local/share",
++	    "/usr/local/share/fuxi", "/usr/local/share/fuxi/wlan",
++	};
++	for (unsigned i = 0; i <= 5; i++) {
++		const char *p = (i < 5) ? levels[i] : path;
++		vnode_t lp = NULL;
++		int le = vnode_lookup(p, 0, &lp, ctx);
++		if (le) {
++			printf("FUXI WLAN DIAG: path %s lookup errno %d\n", p, le);
++			continue;
++		}
++		printf("FUXI WLAN DIAG: path %s lookup ok vtype %d (%s)\n",
++		    p, (int)vnode_vtype(lp), wl_fwdiag_vtype(vnode_vtype(lp)));
++		vnode_put(lp);
++	}
++	vnode_t rvp = vfs_rootvnode();
++	if (!rvp) {
++		printf("FUXI WLAN DIAG: root vnode unavailable for statfs\n");
++		return;
++	}
++	struct vfsstatfs *sf = vnode_vfsstatfs(rvp);
++	if (!sf) {
++		printf("FUXI WLAN DIAG: root statfs unavailable\n");
++	} else {
++		printf("FUXI WLAN DIAG: root volume fstype '%s' mntfrom '%s'\n",
++		    sf->f_fstypename, sf->f_mntfromname);
++	}
++	vnode_put(rvp);
++}
++
+ static int
+ wl_read_firmware(void)
+ {
+@@ -2970,9 +3109,20 @@
+ 	}
+ 	if (!root) { return 1; }
+ 	vnode_put(root);
+-	int e = vnode_open(wl_fw_path, FREAD | O_NOFOLLOW | O_NONBLOCK, 0, 0, &vp, ctx);
++	/* Retry the open for up to 120 s (1200 x 100 ms); the root mount/name
++	 * space can still be settling at this early boot step. Each wait yields
++	 * this dedicated WLAN thread only; the main/launchd thread is not blocked.
++	 * On final failure the one-shot path/volume diagnostic runs once. */
++	int e = 0;
++	for (unsigned i = 0; i <= 1200; i++) {
++		e = vnode_open(wl_fw_path, FREAD | O_NOFOLLOW | O_NONBLOCK, 0, 0, &vp, ctx);
++		if (!e) { break; }
++		if (i < 1200) { wl_sleep(100); }
++	}
+ 	if (e) {
+-		printf("FUXI WLAN: firmware open failed errno %d\n", e);
++		printf("FUXI WLAN DIAG: firmware open failed after 120 s retry window (1200 x 100 ms); "
++		    "last errno %d\n", e);
++		wl_fw_open_diag(wl_fw_path, ctx);
+ 		return 2;
+ 	}
+ 	struct vnode_attr a;
+@@ -5159,6 +5309,8 @@
+ static void
+ wl5_abort(unsigned step)
+ {
++	printf("FUXI WLAN: wl5_abort: step=%u limit=%u report[0]=%#x report[3]=%#x faults=%u (containment path)\n",
++	    step, wl5_report[1], wl5_report[0], wl5_report[3], fw_faults);
+ 	if (wl_w11_attempted) { wl_w11_stop(); }
+ 	wl5_status(step);
+ 	(void)wl_smmu_fault(step);
+@@ -5411,14 +5563,29 @@
+ 			fw_m3_summary(s);
+ 		}
+ 		if (e) {
++			if (wl_ath_enabled && s < 18) {
++				printf("FUXI WLAN: ath12k run NOT reached: legacy aborted at step %u before step 18; "
++				    "wl_ath_run()/PCIe enum skipped\n", s);
++			}
+ 			r4[3] = s << 8 | (unsigned)e;
+ 			wl5_report[3] = r4[3];
+-			if (s >= 17 || (wl_seq_flags && s >= 8)) { wl5_abort(s); }
++			bool abort_called = s >= 17 || (wl_seq_flags && s >= 8);
++			if (wl_ath_enabled) {
++				printf("FUXI WLAN: legacy stop: step %u returned reason %u (code %#x); steps 17..18 not "
++				    "attempted, so wl_ath_run()/PCIe enum were never invoked; wl5_abort containment %s\n",
++				    s, e, r4[3], abort_called ? "invoked" : "skipped (step below abort threshold)");
++			}
++			printf("FUXI WLAN: m6 report snapshot: magic %#x limit %u last step %u code %#x (reason %u); "
++			    "magic is the pre-run WL5 header, not a stage error\n",
++			    wl5_report[0], wl5_report[1], wl5_report[2], wl5_report[3], e);
++			if (abort_called) { wl5_abort(s); }
+ 			printf("FUXI WLAN: stopped at step %u reason %u ESR %#x FAR %#llx; reboot to retry\n",
+ 			    s, e, fw_fault_esr, fw_fault_far);
+ 			goto out;
+ 		}
+ 		if (wl_ath_enabled && s == 18) {
++			printf("FUXI WLAN: ath12k run reached step %u; invoking wl_ath_run (wl_ath_enabled=%d)\n",
++			    s, wl_ath_enabled);
+ 			int native_error = wl_ath_run();
+ 			printf("FUXI WLAN: ath12k diagnostic result %d; legacy steps 19..28 skipped\n", native_error);
+ 			wl5_abort(18);
+diff --git a/xnu/fuxi-wlan/fuxi_wlan_ath12k.inc b/xnu/fuxi-wlan/fuxi_wlan_ath12k.inc
+--- a/xnu/fuxi-wlan/fuxi_wlan_ath12k.inc
++++ b/xnu/fuxi-wlan/fuxi_wlan_ath12k.inc
+@@ -5,18 +5,41 @@
+ 
+ #define WLA_BYTES (128u << 20)
+ #define WLA_BLOCKS 16384u
++/* Bounded boot budgets: a stuck PBL must never hold the WLAN thread past these
++ * windows; on expiry the glue stops the module and falls back to today's
++ * containment instead of hanging boot. */
++#define WLA_ROOT_WAIT_MS 120000u
++#define WLA_READY_BUDGET_MS 20000u
++/* Primary root-volume firmware directory; the fallback is the bindfs/preboot
++ * standalone firmware clue. Each candidate is opened and reported on its own,
++ * so a missing primary and a missing fallback cannot be merged into one -1. */
++#define WLA_FW_PRIMARY_DIR "/usr/local/share/fuxi/wlan"
++#define WLA_FW_FALLBACK_DIR "/usr/standalone/firmware"
++/* PCIe PARF/DBI windows, matching the legacy bring-up constants. */
++#define WLA_PARF_PA 0x01c00000ull
++#define WLA_DBI_PA 0x60000000ull
++#define WLA_BAR0_WINDOW 0x4000u
++/* Expected WCN7850 PCI identifiers. */
++#define WLA_PCI_VENDOR 0x17cbu
++#define WLA_PCI_DEVICE 0x1107u
+ static struct fwa_arena wla_pool;
+ static struct fwa_block *wla_blocks;
+ static unsigned wla_express, wla_msi, wla_failed;
++static bool wla_root_waited, wla_probed;
++/* BAR0 base/size are filled only by config-space enumeration and BAR
++ * allocation; there is no constant fallback base. */
++static uint64_t wla_bar0_pa;
++static size_t wla_bar0_size;
+ static struct {
+ 	const char *name, *file;
++	uint64_t expected;
+ 	void *memory;
+ 	size_t bytes;
+ } wla_firmware[] = {
+-	{"amss.bin", "amss20.bin", NULL, 0},
+-	{"m3.bin", "m3.bin", NULL, 0},
+-	{"board-2.bin", "board-2.bin", NULL, 0},
+-	{"regdb.bin", "regdb_xiaomi.bin", NULL, 0},
++	{"amss.bin", "amss20.bin", 6090816ull, NULL, 0},
++	{"m3.bin", "m3.bin", 299660ull, NULL, 0},
++	{"board-2.bin", "board-2.bin", 2431968ull, NULL, 0},
++	{"regdb.bin", "regdb_xiaomi.bin", 0, NULL, 0},
+ };
+ 
+ static uint64_t
+@@ -31,6 +54,49 @@
+ wla_now_ms(void)
+ {
+ 	return wla_now_ns() / 1000000ull;
++}
++
++/* The firmware files live on the root volume; before the first open, wait for
++ * it like the legacy diagnostic path does. One wait per boot; failure is
++ * reported with the budget in milliseconds so a slow mount is distinguished
++ * from a missing image. */
++static int
++wla_wait_root(void)
++{
++	if (wla_root_waited) { return 0; }
++	uint64_t deadline = wla_now_ms() + WLA_ROOT_WAIT_MS;
++	for (;;) {
++		vnode_t root = vfs_rootvnode();
++		if (root) {
++			vnode_put(root);
++			wla_root_waited = true;
++			return 0;
++		}
++		if (wla_now_ms() >= deadline) {
++			printf("FUXI ATH12K: root volume not mounted within %u ms; firmware fetch deferred\n",
++			    WLA_ROOT_WAIT_MS);
++			return -1;
++		}
++		wl_sleep(100);
++	}
++}
++
++/* Snapshot the fault-contained MHI/BHI registers. Reads only; on a fault the
++ * caller skips the watch so an inaccessible BAR cannot be mistaken for PBL. */
++static void
++wla_mhi_snapshot(const char *phase)
++{
++	if (!wl_mhi_valid || fw_faults) { return; }
++	uint32_t ver = wl_mrd(0x08);
++	uint32_t cfg = wl_mrd(0x10);
++	uint32_t ee = wl_mrd(wl_bhi + 0x28);
++	uint32_t status = wl_mrd(0x48);
++	uint32_t ctrl = wl_mrd(0x38);
++	uint32_t bhi = wl_mrd(wl_bhi + 0x2c);
++	if (fw_faults) { return; }
++	printf("FUXI ATH12K: MHI %s MHIVER %#x MHICFG %#x EE %#x (%s) MHISTATUS %#x "
++	    "(state %s ready %u) MHICTRL %#x BHI %#x\n", phase, ver, cfg, ee,
++	    wl_mhi_ee(ee), status, wl_mhi_state((status >> 8) & 255), status & 1, ctrl, bhi);
+ }
+ 
+ static void *
+@@ -113,6 +179,99 @@
+ 		return;
+ 	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++/* Open one absolute firmware path, getattr, allocate, read, close. On
++ * success returns 0 and hands out the block and size; every failure stage keeps the
++ * raw open errno, and the absolute path is printed with the line. Synthetic
++ * stages: -2 getattr/type/size, -3 allocation, -4 read residual. */
++static int
++wla_fw_open_at(const char *base, const char *file, const char *path,
++    void **memory, uint64_t *size, int *residual)
++{
++	vnode_t filev = NULL;
++	vfs_context_t context = vfs_context_kernel();
++	*memory = NULL;
++	*size = 0;
++	*residual = 0;
++	int error = vnode_open(path, FREAD | O_NOFOLLOW | O_NONBLOCK, 0, 0, &filev, context);
++	struct vnode_attr attributes;
++	VATTR_INIT(&attributes);
++	VATTR_WANTED(&attributes, va_data_size);
++	if (!error) {
++		error = vnode_getattr(filev, &attributes, context);
++		if (!error && (vnode_vtype(filev) != VREG ||
++		    !VATTR_IS_SUPPORTED(&attributes, va_data_size) ||
++		    !attributes.va_data_size || attributes.va_data_size > WL_FW_MAX)) { error = -2; }
++		*size = (uint64_t)attributes.va_data_size;
++	}
++	void *block = (!error ? wla_alloc((size_t)*size) : NULL);
++	if (!block) { error = error ? error : -3; }
++	if (!error) {
++		error = vn_rdwr(UIO_READ, filev, (caddr_t)block, (int)*size, 0,
++		    UIO_SYSSPACE, 0, vfs_context_ucred(context), residual, vfs_context_proc(context));
++		if (*residual) { error = -4; }
++	}
++	int close_error = filev ? vnode_close(filev, FREAD, context) : 0;
++	if (error) {
++		wla_free(block);
++		if (close_error) {
++			printf("FUXI ATH12K: firmware %s (%s) close failed path %s errno %d\n",
++			    base, file, path, close_error);
++		}
++		printf("FUXI ATH12K: firmware %s (%s) path %s unavailable stage %d errno %d "
++		    "residual %d size %llu\n", base, file, path, error,
++		    error > 0 ? error : 0, *residual, *size);
++		return -1;
++	}
++	*memory = block;
++	return 0;
++}
++
++/* One-shot directory/file stat probe before the firmware retry loop: separate
++ * "directory not visible" from "present but wrong size", with the expected
++ * reference sizes for the three shipped images. */
++static void
++wla_fw_probe(void)
++{
++	if (wla_probed) { return; }
++	wla_probed = true;
++	vfs_context_t context = vfs_context_kernel();
++	char path[128];
++	snprintf(path, sizeof(path), "%s", WLA_FW_PRIMARY_DIR);
++	vnode_t dir = NULL;
++	int open_err = vnode_open(path, FREAD | O_NOFOLLOW | O_NONBLOCK, 0, 0, &dir, context);
++	int attr_err = 0;
++	uint64_t dir_size = 0;
++	if (!open_err) {
++		struct vnode_attr attributes;
++		VATTR_INIT(&attributes);
++		VATTR_WANTED(&attributes, va_data_size);
++		attr_err = vnode_getattr(dir, &attributes, context);
++		if (!attr_err) { dir_size = (uint64_t)attributes.va_data_size; }
++		vnode_close(dir, FREAD, context);
++	}
++	printf("FUXI ATH12K: firmware dir %s open errno %d getattr errno %d visible %s size %llu\n",
++	    path, open_err, attr_err, open_err || attr_err ? "no" : "yes", dir_size);
++	for (unsigned index = 0; index < sizeof(wla_firmware) / sizeof(wla_firmware[0]); index++) {
++		snprintf(path, sizeof(path), "%s/%s", WLA_FW_PRIMARY_DIR,
++		    wla_firmware[index].file);
++		vnode_t filev = NULL;
++		int e = vnode_open(path, FREAD | O_NOFOLLOW | O_NONBLOCK, 0, 0, &filev, context);
++		uint64_t size = 0;
++		int gerr = 0;
++		if (!e) {
++			struct vnode_attr attributes;
++			VATTR_INIT(&attributes);
++			VATTR_WANTED(&attributes, va_data_size);
++			gerr = vnode_getattr(filev, &attributes, context);
++			if (!gerr) { size = (uint64_t)attributes.va_data_size; }
++			vnode_close(filev, FREAD, context);
++		}
++		printf("FUXI ATH12K: probe %s (%s) path %s size %llu errno %d expected %llu\n",
++		    wla_firmware[index].name, wla_firmware[index].file, path, size, e,
++		    (unsigned long long)wla_firmware[index].expected);
++	}
+ }
+ 
+ static int
+@@ -143,35 +302,28 @@
+ 	}
+ 	if (index == sizeof(wla_firmware) / sizeof(wla_firmware[0])) { return -1; }
+ 	if (!wla_firmware[index].memory) {
+-		char path[128];
+-		vnode_t file = NULL;
+-		vfs_context_t context = vfs_context_kernel();
+-		snprintf(path, sizeof(path), "/usr/local/share/fuxi/wlan/%s", wla_firmware[index].file);
+-		int error = vnode_open(path, FREAD | O_NOFOLLOW | O_NONBLOCK, 0, 0, &file, context);
+-		if (error) { return -1; }
+-		struct vnode_attr attributes;
+-		VATTR_INIT(&attributes);
+-		VATTR_WANTED(&attributes, va_data_size);
+-		error = vnode_getattr(file, &attributes, context);
+-		if (error || vnode_vtype(file) != VREG || !VATTR_IS_SUPPORTED(&attributes, va_data_size) ||
+-		    !attributes.va_data_size || attributes.va_data_size > WL_FW_MAX) { error = -1; }
+-		void *memory = error ? NULL : wla_alloc((size_t)attributes.va_data_size);
+-		if (!memory) { error = -1; }
+-		if (!error) {
+-			int residual = 0;
+-			error = vn_rdwr(UIO_READ, file, (caddr_t)memory, (int)attributes.va_data_size, 0,
+-			    UIO_SYSSPACE, 0, vfs_context_ucred(context), &residual, vfs_context_proc(context));
+-			if (residual) { error = -1; }
+-		}
+-		if (vnode_close(file, FREAD, context)) { error = -1; }
+-		if (error) {
+-			wla_free(memory);
++		char primary[128], fallback[128];
++		void *memory = NULL;
++		uint64_t size = 0;
++		int residual = 0;
++		if (wla_wait_root()) { return -1; }
++		snprintf(primary, sizeof(primary), "%s/%s", WLA_FW_PRIMARY_DIR,
++		    wla_firmware[index].file);
++		snprintf(fallback, sizeof(fallback), "%s/%s", WLA_FW_FALLBACK_DIR,
++		    wla_firmware[index].file);
++		/* Primary first; only then the bindfs/preboot clue. Each candidate
++		 * logs its own absolute path and stage/errno, never merged into -1. */
++		if (wla_fw_open_at(base, wla_firmware[index].file, primary,
++		    &memory, &size, &residual) ||
++		    wla_fw_open_at(base, wla_firmware[index].file, fallback,
++		    &memory, &size, &residual)) {
+ 			return -1;
+ 		}
+ 		wla_firmware[index].memory = memory;
+-		wla_firmware[index].bytes = (size_t)attributes.va_data_size;
+-		printf("FUXI ATH12K: firmware %s from %s bytes %llu\n", base,
+-		    wla_firmware[index].file, (uint64_t)wla_firmware[index].bytes);
++		wla_firmware[index].bytes = (size_t)size;
++		printf("FUXI ATH12K: firmware %s loaded from %s bytes %llu expected %llu\n",
++		    base, wla_firmware[index].file, (uint64_t)wla_firmware[index].bytes,
++		    (unsigned long long)wla_firmware[index].expected);
+ 	}
+ 	*data = wla_firmware[index].memory;
+ 	*bytes = wla_firmware[index].bytes;
+@@ -222,12 +374,227 @@
+ 	return 0;
+ }
+ 
++/* ---- v23diag: observation-only dumps. No judgment, return value, or state
++ * change here; these only log what the ADT and iATU currently expose. ---- */
++
++/* Probe candidate PCIe/WiFi ADT nodes and their common aperture/iommu
++ * properties. Missing node or missing property is logged as absent, not
++ * treated as an error. */
++static void
++wla_adt_pcie_diag(void)
++{
++	static const char *nodes[] = {
++	    "/chosen", "/pcie0", "/pcie", "/soc/pcie0", "/soc/pcie", "/wifi0"
++	};
++	static const char *props[] = {
++	    "compatible", "status", "ranges", "reg", "iommu",
++	    "dma-coherent", "msi-parent", "mac-address-wifi0"
++	};
++	for (unsigned ni = 0; ni < sizeof(nodes) / sizeof(nodes[0]); ni++) {
++		DTEntry node;
++		int lr = SecureDTLookupEntry(NULL, nodes[ni], &node);
++		if (lr != kSuccess) {
++			printf("FUXI ATH12K: ADT node %s lookup absent (err %d)\n", nodes[ni], lr);
++			continue;
++		}
++		printf("FUXI ATH12K: ADT node %s lookup ok\n", nodes[ni]);
++		for (unsigned pi = 0; pi < sizeof(props) / sizeof(props[0]); pi++) {
++			const void *val = NULL;
++			unsigned len = 0;
++			int pr = SecureDTGetProperty(node, props[pi], &val, &len);
++			if (pr != kSuccess || val == NULL || len == 0) {
++				printf("FUXI ATH12K: ADT   %s/%s absent\n", nodes[ni], props[pi]);
++				continue;
++			}
++			uint32_t word = 0;
++			const uint8_t *bytes = (const uint8_t *)val;
++			for (unsigned b = 0; b < len && b < 4; b++) { word |= (uint32_t)bytes[b] << (8 * b); }
++			printf("FUXI ATH12K: ADT   %s/%s len %u first %#x\n",
++			    nodes[ni], props[pi], len, word);
++		}
++	}
++}
++
++/* Read back the outbound/inbound iATU region registers. Synopsys DWC layout:
++ * +0x00 region type, +0x04 control (enable bit31), +0x08 lower base,
++ * +0x0c lower base high, +0x10 limit, +0x14 target lower, +0x18 target high,
++ * +0x1c, +0x20. Region n sits at DBI + 0x1000 (OB) / 0x1100 (IB) + n*0x200. */
++static void
++wla_atu_diag(void)
++{
++	static const struct { const char *dir; unsigned slot; uint64_t base; } atu[] = {
++	    { "OB", 0, WLA_DBI_PA + 0x1000ull },
++	    { "OB", 1, WL_ATU1 },
++	    { "IB", 1, WLA_DBI_PA + 0x1100ull + 0x200ull }
++	};
++	static const uint16_t offs[] = { 0x00, 0x04, 0x08, 0x0c, 0x10, 0x14, 0x18, 0x1c, 0x20 };
++	for (unsigned a = 0; a < sizeof(atu) / sizeof(atu[0]); a++) {
++		for (unsigned o = 0; o < sizeof(offs) / sizeof(offs[0]); o++) {
++			uint32_t v = wl_prd(atu[a].base + offs[o]);
++			printf("FUXI ATH12K: iATU %s slot %u base %#llx +%#03x = %#x\n",
++			    atu[a].dir, atu[a].slot, (unsigned long long)atu[a].base, offs[o], v);
++		}
++	}
++}
++
++/* PCIe config-space enumeration for the WCN7850. The config window base is
++ * the legacy glue ECAM/CFG0 aperture (WL_EPCFG); this glue parses no ADT
++ * property for it. BAR0 base is never filled from a constant: it comes either
++ * from the device's programmed BAR or from the allocation below. All accesses
++ * stay fault-contained; any failure returns nonzero for the existing
++ * containment path. */
++static int
++wla_pcie_enumerate(void)
++{
++	printf("FUXI ATH12K: wla_pcie_enumerate() entered (caller wl_ath_run); "
++	    "wl_ath_enabled=%d bar0_pa=%#llx bar0_size=%#x fw_faults=%u\n",
++	    wl_ath_enabled, (unsigned long long)wla_bar0_pa,
++	    (uint32_t)wla_bar0_size, fw_faults);
++	wla_adt_pcie_diag();
++	wla_atu_diag();
++	/* The legacy iATU CFG0 region exposes one endpoint (bus 0/dev 0/fn 0);
++	 * there is no per-BDF decode on this window. The scan range is logged. */
++	const unsigned bus = 0, dev = 0, fn = 0;
++	uint32_t id = wl_prd(WL_EPCFG);
++	uint32_t classrev = wl_prd(WL_EPCFG + 0x08);
++	uint32_t htype = wl_prd(WL_EPCFG + 0x0e) & 0xffu;
++	uint16_t vendor = id & 0xffffu, device = id >> 16;
++	uint32_t class_code = (classrev >> 16) & 0xffffu;
++	printf("FUXI ATH12K: PCIe enum config window PA %#llx; BDF %u:%u.%u id %#x vendor %#x "
++	    "device %#x class %#x header %#x candidates 1\n",
++	    (unsigned long long)WL_EPCFG, bus, dev, fn, id, vendor, device,
++	    class_code, htype);
++	if (fw_faults || vendor != WLA_PCI_VENDOR || device != WLA_PCI_DEVICE) {
++		printf("FUXI ATH12K: PCIe enum: no WCN7850 (expected vendor %#x device %#x class %#x; "
++		    "actual vendor %#x device %#x class %#x header %#x); fall back to containment\n",
++		    WLA_PCI_VENDOR, WLA_PCI_DEVICE, 0x280u,
++		    vendor, device, class_code, htype);
++		printf("FUXI ATH12K: enum exit: no matching EP (fw_faults=%u, vendor/device mismatch)\n",
++		    fw_faults);
++		return 1;
++	}
++	/* BAR0 sizing: clear MEM decode, write all ones, read back, restore the
++	 * original BAR before the allocation attempt. */
++	uint32_t cmd = wl_prd(WL_EPCFG + 0x04);
++	uint32_t orig_lo = wl_prd(WL_EPCFG + 0x10);
++	uint32_t orig_hi = wl_prd(WL_EPCFG + 0x14);
++	wl_pwr(WL_EPCFG + 0x04, cmd & 0xffffu & ~7u);
++	wl_pwr(WL_EPCFG + 0x10, 0xffffffffu);
++	wl_pwr(WL_EPCFG + 0x14, 0xffffffffu);
++	uint32_t size_lo = wl_prd(WL_EPCFG + 0x10);
++	uint32_t size_hi = wl_prd(WL_EPCFG + 0x14);
++	wl_pwr(WL_EPCFG + 0x10, orig_lo);
++	wl_pwr(WL_EPCFG + 0x14, orig_hi);
++	printf("FUXI ATH12K: BAR0 orig %#x/%#x sizing %#x/%#x\n",
++	    orig_lo, orig_hi, size_lo, size_hi);
++	if ((size_lo & 0xfu) != 0x4u || size_hi != 0xffffffffu) {
++		printf("FUXI ATH12K: BAR0 is not a 32-bit MEM BAR (low %#x upper %#x); containment\n",
++		    size_lo, size_hi);
++		printf("FUXI ATH12K: enum exit: BAR0 not a 32-bit MEM BAR\n");
++		return 1;
++	}
++	uint32_t size = ~(size_lo & ~0xfu) + 1u;
++	if (!size || size > 0x200000u || (size & (size - 1))) {
++		printf("FUXI ATH12K: BAR0 size %#x out of range or not power-of-two; containment\n", size);
++		printf("FUXI ATH12K: enum exit: BAR0 size invalid\n");
++		return 1;
++	}
++	/* Allocate a size-aligned slot inside the legacy iATU MEM aperture,
++	 * skipping the fixed DBI/config/sliding-window regions (interval
++	 * overlap, not base-only). */
++	uint64_t candidate = 0;
++	const uint64_t reserved[] = {
++	    WLA_DBI_PA, WLA_DBI_PA + 0x4000u,
++	    WL_EPCFG, WL_EPCFG + 0x4000u,
++	    0x60480000ull, 0x60480000ull + 0x80000u
++	};
++	for (uint64_t slot = WL_MEM_LO; slot + size <= WL_MEM_HI + 1ull; slot += size) {
++		bool overlap = false;
++		for (unsigned k = 0; k < sizeof(reserved) / sizeof(reserved[0]); k += 2) {
++			if (slot < reserved[k + 1] && slot + size > reserved[k]) { overlap = true; break; }
++		}
++		if (!overlap) { candidate = slot; break; }
++	}
++	if (!candidate) {
++		printf("FUXI ATH12K: BAR0 no free slot in aperture %#llx-%#llx; containment\n",
++		    (unsigned long long)WL_MEM_LO, (unsigned long long)WL_MEM_HI);
++		printf("FUXI ATH12K: enum exit: no free slot in MEM aperture\n");
++		return 1;
++	}
++	wl_pwr(WL_EPCFG + 0x10, (uint32_t)candidate);
++	wl_pwr(WL_EPCFG + 0x14, 0);
++	uint32_t rb_lo = wl_prd(WL_EPCFG + 0x10);
++	uint32_t rb_hi = wl_prd(WL_EPCFG + 0x14);
++	printf("FUXI ATH12K: BAR0 assigned %#llx readback %#x/%#x\n",
++	    (unsigned long long)candidate, rb_lo, rb_hi);
++	if ((rb_lo & ~0xfu) != (uint32_t)candidate || rb_hi != 0) {
++		wl_pwr(WL_EPCFG + 0x10, orig_lo);
++		wl_pwr(WL_EPCFG + 0x14, orig_hi);
++		printf("FUXI ATH12K: BAR0 assignment readback mismatch; link/ECAM not decoded; containment\n");
++		printf("FUXI ATH12K: enum exit: BAR0 write readback mismatch\n");
++		return 1;
++	}
++	wl_pwr(WL_EPCFG + 0x04, (cmd & 0xffffu & ~7u) | 2u);
++	uint32_t cmd_rb = wl_prd(WL_EPCFG + 0x04);
++	if (!(cmd_rb & 2u)) {
++		printf("FUXI ATH12K: BAR0 MEM enable not confirmed (cmd/status %#x); containment\n", cmd_rb);
++		printf("FUXI ATH12K: enum exit: MEM enable not confirmed\n");
++		return 1;
++	}
++	wla_bar0_pa = candidate;
++	wla_bar0_size = size;
++	printf("FUXI ATH12K: BAR0 allocated base %#llx size %#x MEM enable confirmed\n",
++	    (unsigned long long)wla_bar0_pa, (uint32_t)wla_bar0_size);
++	printf("FUXI ATH12K: enum exit: success, BAR0 owned by enumeration\n");
++	return 0;
++}
++
+ static void *
+ wla_map_phys(uint64_t address, size_t bytes)
+ {
+-	if (!bytes || address < WL_BAR0 || address - WL_BAR0 >= 0x200000 ||
+-	    bytes > 0x200000 - (address - WL_BAR0)) { return NULL; }
+-	return (void *)(fw_va(WL_BAR0) + (address - WL_BAR0));
++	if (!bytes || !wla_bar0_pa || address < wla_bar0_pa ||
++	    address - wla_bar0_pa >= wla_bar0_size ||
++	    bytes > wla_bar0_size - (address - wla_bar0_pa)) { return NULL; }
++	return (void *)(fw_va(wla_bar0_pa) + (address - wla_bar0_pa));
++}
++
++/* Validate the host BAR0 window before any firmware download. Log the BAR0 PA,
++ * mapped VA, window length and a write/read-back probe. If MHIVER reads a poison
++ * fill (0, all-ones, or a 0xdead-prefixed sentinel) the window is treated as
++ * not really mapped: dump the PCIe side and return failure so the caller falls
++ * back to containment instead of driving a dead device through the MHI sequence. */
++static int
++wla_bar0_probe(void)
++{
++	if (!wla_bar0_pa) {
++		printf("FUXI ATH12K: BAR0 probe skipped: no enumerated/assigned base; containment\n");
++		return 1;
++	}
++	uintptr_t va = (uintptr_t)fw_va(wla_bar0_pa);
++	printf("FUXI ATH12K: BAR0 window PA %#llx VA %p host window %#x barlen %#x\n",
++	    (unsigned long long)wla_bar0_pa, (void *)va, WLA_BAR0_WINDOW,
++	    (uint32_t)wla_bar0_size);
++	uint32_t hiver = wl_prd(wla_bar0_pa + 0x08);
++	uint32_t hicfg = wl_prd(wla_bar0_pa + 0x10);
++	wl_pwr(wla_bar0_pa + 0x38, 0);
++	uint32_t ctrl_rb = wl_prd(wla_bar0_pa + 0x38);
++	printf("FUXI ATH12K: BAR0 write probe off 0x38 wrote 0 readback %#x MHIVER %#x MHICFG %#x\n",
++	    ctrl_rb, hiver, hicfg);
++	bool poison = !va || fw_faults || hiver == 0 || hiver == ~0u || (hiver >> 16) == 0xdead;
++	if (!poison) {
++		printf("FUXI ATH12K: BAR0 mapping looks live; proceed to firmware download\n");
++		return 0;
++	}
++	uint32_t id = wl_prd(WL_EPCFG);
++	uint32_t cmd = wl_prd(WL_EPCFG + 4);
++	uint32_t ltssm = wl_prd(WLA_PARF_PA + 0x1b0);
++	uint32_t dbi4 = wl_prd(WLA_DBI_PA + 4);
++	printf("FUXI ATH12K: PCIe EP id %#x vendor %#x device %#x cmd %#x LTSSM %#x DBI+4 %#x\n",
++	    id, id & 0xffffu, id >> 16, cmd, ltssm, dbi4);
++	printf("FUXI ATH12K: BAR0 at %#llx is not really mapped/placeholder (MHIVER %#x); "
++	    "skip firmware download, fall back to containment\n",
++	    (unsigned long long)wla_bar0_pa, hiver);
++	return 1;
+ }
+ 
+ static void
+@@ -330,20 +697,43 @@
+ 		return 6;
+ 	}
+ 	printf("FUXI ATH12K: %s control transport installed\n", ios ? "iOS native" : "diagnostic");
++	printf("FUXI ATH12K: wl_ath_run() entered; ios=%d wl_ath_enabled=%d fw_faults=%u; "
++	    "pre-enumeration caps check next\n", ios, wl_ath_enabled, fw_faults);
+ 	uint32_t flags = 0;
+ 	wla_express = wl_diag_cap(WL_EPCFG, 0x10, false, &flags);
+ 	wla_msi = wl_diag_cap(WL_EPCFG, 5, false, &flags);
+ 	if (!wla_express || !wla_msi || flags || fw_faults || !wla_available() ||
+ 	    wl_prd(WL_EPCFG) != 0x110717cb || (wl_prd(WL_EPCFG + 4) & 4) ||
+-	    wl_mrd(wl_bhi + 0x28) != 0 || wl_disable_irqs() || wl_download_aspm()) { return 1; }
++	    wl_mrd(wl_bhi + 0x28) != 0 || wl_disable_irqs() || wl_download_aspm()) {
++		printf("FUXI ATH12K: wl_ath_run precheck failed before enumeration "
++		    "(express=%u msi=%u flags=%#x faults=%u avail=%u ep_id=%#x bad_cmd=%u ee=%#x); "
++		    "enum not reached\n",
++		    wla_express, wla_msi, flags, fw_faults, wla_available(),
++		    wl_prd(WL_EPCFG), (wl_prd(WL_EPCFG + 4) & 4), wl_mrd(wl_bhi + 0x28));
++		return 1;
++	}
++	if (wla_pcie_enumerate() || wla_bar0_probe()) { return 1; }
++	wla_fw_probe();
+ 	const uint8_t *data;
+ 	size_t bytes;
++	uint64_t fw_start = wla_now_ms();
+ 	for (unsigned attempt = 0; attempt < 1200; attempt++) {
+ 		if (!wla_fw_get("amss.bin", &data, &bytes) &&
+ 		    !wla_fw_get("m3.bin", &data, &bytes) &&
+ 		    !wla_fw_get("board-2.bin", &data, &bytes)) { break; }
+-		if (attempt == 1199) { return 2; }
++		if (attempt == 1199) {
++			printf("FUXI ATH12K: firmware cache incomplete after %llu ms; stop before module start, contain\n",
++			    (unsigned long long)(wla_now_ms() - fw_start));
++			return 2;
++		}
+ 		wl_sleep(100);
++	}
++	for (unsigned index = 0; index < sizeof(wla_firmware) / sizeof(wla_firmware[0]); index++) {
++		if (wla_firmware[index].memory) {
++			printf("FUXI ATH12K: cached firmware %s -> %s bytes %llu\n",
++			    wla_firmware[index].name, wla_firmware[index].file,
++			    (uint64_t)wla_firmware[index].bytes);
++		}
+ 	}
+ 	uint64_t alignment = WLA_BYTES;
+ 	wl_iova_next = (wl_iova_next + alignment - 1) & ~(alignment - 1);
+@@ -352,23 +742,51 @@
+ 	    fwa_init(&wla_pool, (void *)wl_ath_arena.va, wl_ath_arena.iova, WLA_BYTES, wla_blocks, WLA_BLOCKS) ||
+ 	    wl_smmu_enable() || wl_smmu_fault(18) || wl_rc_check()) { return 3; }
+ 	board = (struct nw_board){
+-		(void *)fw_va(WL_BAR0), 0x200000, 0x1107, (uint16_t)wla_msi, 1000,
++		(void *)fw_va(wla_bar0_pa), wla_bar0_size, 0x1107, (uint16_t)wla_msi, 1000,
+ 		wla_cfg_read, wla_cfg_write, wla_msi_target, wla_map_phys, 0
+ 	};
+ 	wl_pwr(WL_EPCFG + 4, (wl_prd(WL_EPCFG + 4) & 0xffff) | 0x406);
+ 	if (fw_faults || (wl_prd(WL_EPCFG + 4) & 0x406) != 0x406) { return 4; }
+ 	printf("FUXI ATH12K: start from PBL, full BAR, owned 128 MiB DMA, IRQ polling; legacy MHI skipped\n");
++	wla_mhi_snapshot("pre-start PBL");
+ 	nw_wifi_irq_mode(0);
+ 	int error = nw_wifi_start(&platform, &board);
+-	bool attached = false, completed = false;
++	bool attached = false, completed = false, ready_seen = false;
+ 	uint64_t started = wla_now_ms(), report = started;
+ 	unsigned spins = 0;
++	uint32_t ee_last = 0xffffffffu;
++	if (!error) { wla_mhi_snapshot("module started"); }
+ 	while (!error && !fw_faults && !wla_failed && !wla_control.error &&
+ 	    ((ios && wli.published) || wla_now_ms() - started < 90000)) {
+ 		wla_control_awake = 0;
+ 		/* nonzero while frames move: go round again without sleeping, but not for ever */
+ 		int moving = nw_wifi_step();
+ 		uint64_t now = wla_now_ms();
++		if (wl_mhi_valid && !fw_faults) {
++			uint32_t status = wl_mrd(0x48);
++			uint32_t ee = wl_mrd(wl_bhi + 0x28);
++			if (!fw_faults) {
++				bool ready = status & 1u;
++				if (ready && !ready_seen) {
++					ready_seen = true;
++					printf("FUXI ATH12K: MHI READY observed after %llu ms; state %s EE %s\n",
++					    (unsigned long long)(now - started),
++					    wl_mhi_state((status >> 8) & 255), wl_mhi_ee(ee));
++				}
++				if (ee != ee_last) {
++					printf("FUXI ATH12K: EE %#x (%s) after %llu ms\n", ee,
++					    wl_mhi_ee(ee), (unsigned long long)(now - started));
++					ee_last = ee;
++				}
++				if (!ready_seen && now - started >= WLA_READY_BUDGET_MS) {
++					printf("FUXI ATH12K: MHI READY not observed within %u ms "
++					    "(MHISTATUS %#x EE %#x); stop module, fall back to containment\n",
++					    WLA_READY_BUDGET_MS, status, ee);
++					error = -1;
++					break;
++				}
++			}
++		}
+ 		if (!attached && nw_wifi_stats.stage >= 4) {
+ 			error = nw_wifi_control_attach(ios ? &wli.session : &wla_control.session);
+ 			attached = !error;
+diff --git a/xnu/patches/0099-fuxi-wlan.patch b/xnu/patches/0099-fuxi-wlan.patch
+--- a/xnu/patches/0099-fuxi-wlan.patch
++++ b/xnu/patches/0099-fuxi-wlan.patch
+@@ -29,7 +29,7 @@
+  	sweet_sample_start();
+ --- a/bsd/dev/fuxi_wlan.c
+ +++ b/bsd/dev/fuxi_wlan.c
+-@@ -0,0 +1,5508 @@
++@@ -0,0 +1,5675 @@
+ +/*
+ + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
+ + * assignment and a read-only MHI/BHI register dump from XNU.
+@@ -98,6 +98,7 @@
+ +#include <sys/systm.h>
+ +#include <sys/fcntl.h>
+ +#include <sys/vnode.h>
+++#include <sys/mount.h>
+ +#include <sys/uio.h>
+ +#include <sys/random.h>
+ +#include <string.h>
+@@ -624,6 +625,7 @@
+ +#define WL_BAR0_END 0x605fffffu
+ +#define WL_EPCFG    0x60100000ull
+ +static uint32_t wl4_report[64];
+++static bool wl_ath_enabled;	/* forward declaration; ath12k run path gates legacy steps */
+ +
+ +static const char *
+ +wl_mhi_state(uint32_t s)
+@@ -637,6 +639,62 @@
+ +{
+ +	static const char *n[8] = {"PBL", "SBL", "AMSS", "RDDM", "WFW", "PTHRU", "EDL", "FP"};
+ +	return e < 8 ? n[e] : "?";
+++}
+++
+++/* v20diag: read-only PCIe cmd/status decode and link snapshot. No config
+++ * writes; every access is fault-contained through wl_prd. Observations only. */
+++static unsigned wl_diag_cap(uint64_t cfg, unsigned id, bool ext, uint32_t *flags);
+++
+++static void
+++wl_diag_cmdstatus(const char *tag, uint32_t v)
+++{
+++	uint32_t cmd = v & 0xffffu, st = v >> 16;
+++	static const struct { unsigned bit; const char *name; } cmd_bits[] = {
+++	    {0, "I/O space"}, {1, "Memory space"}, {2, "Bus master"},
+++	    {3, "Special cycle"}, {4, "Mem write invalidate"}, {5, "VGA palette"},
+++	    {6, "Parity error"}, {7, "SERR#"}, {8, "Fast back-to-back"},
+++	    {9, "Interrupt disable"}, {11, "Mem write invalidate enable"},
+++	};
+++	static const struct { unsigned bit; const char *name; } st_bits[] = {
+++	    {2, "Interrupt status"}, {4, "Capabilities list"}, {5, "66 MHz"},
+++	    {7, "Fast back-to-back"}, {8, "Parity error detected"},
+++	    {11, "Signaled target abort"}, {12, "Received target abort"},
+++	    {13, "Received master abort"}, {14, "Signaled system error"},
+++	    {15, "Detected parity error"},
+++	};
+++	printf("FUXI WLAN: %s cmd/status %#x: command %#x", tag, v, cmd);
+++	for (unsigned i = 0; i < sizeof(cmd_bits) / sizeof(cmd_bits[0]); i++) {
+++		if (cmd & (1u << cmd_bits[i].bit)) { printf(" [%s]", cmd_bits[i].name); }
+++	}
+++	printf("; status %#x", st);
+++	for (unsigned i = 0; i < sizeof(st_bits) / sizeof(st_bits[0]); i++) {
+++		if (st & (1u << st_bits[i].bit)) { printf(" [%s]", st_bits[i].name); }
+++	}
+++	printf("\n");
+++}
+++
+++/* Link snapshot at the legacy failure point. Offsets follow the existing
+++ * glue: RC PCIe cap via wl_diag_cap(WL_DBI, 0x10), LNKCTL/STA at cap+0x10;
+++ * LTSSM at WL_PARF+0x1b0; PERST on TLMM gpio94 data+4; EP PM cap id 1,
+++ * PMCSR at cap+4; RC/EP cmd/status at config +0x04. */
+++static void
+++wl_diag_link_note(const char *tag)
+++{
+++	uint32_t flags = 0;
+++	unsigned rc_cap = wl_diag_cap(WL_DBI, 0x10, false, &flags);
+++	uint32_t rc_lnk = rc_cap ? wl_prd(WL_DBI + rc_cap + 0x10) : ~0u;
+++	uint32_t ltssm = wl_prd(WL_PARF + 0x1b0);
+++	uint32_t perst = wl_prd(TS_TLMM + 0x1000ull * 94 + 4);
+++	uint32_t ep_id = wl_prd(WL_EPCFG);
+++	unsigned ep_pm = (ep_id != ~0u && ep_id != 0) ? wl_diag_cap(WL_EPCFG, 1, false, &flags) : 0;
+++	uint32_t pmcsr = ep_pm ? wl_prd(WL_EPCFG + ep_pm + 4) : ~0u;
+++	uint32_t rc_cs = wl_prd(WL_DBI + 0x04);
+++	uint32_t ep_cs = wl_prd(WL_EPCFG + 0x04);
+++	printf("FUXI WLAN: %s link: PARF_LTSSM %#x RC LNKCTL/STA %#x (pcie-cap %#x) "
+++	    "PERST_IO %#x EP PMCSR %#x (pm-cap %#x) EP id %#x\n",
+++	    tag, ltssm, rc_lnk, rc_cap, perst, pmcsr, ep_pm, ep_id);
+++	wl_diag_cmdstatus("RC", rc_cs);
+++	wl_diag_cmdstatus("EP", ep_cs);
+ +}
+ +
+ +/* 0 on success or a nonzero reason. */
+@@ -692,6 +750,14 @@
+ +			printf("FUXI WLAN: BAR0 readback %#x/%#x unexpected; not assigning\n", rb, m3[88]);
+ +			return 1;
+ +		}
+++		if (wl_ath_enabled) {
+++			/* ath12k glue owns BAR0: its config-space enumeration sizes the
+++			 * BAR, allocates the base, verifies readback and sets MEM enable.
+++			 * The legacy constant 0x60400000 must not be written here. */
+++			printf("FUXI WLAN: legacy BAR0 path skipped: enumeration owns BAR0 (size %#x)\n",
+++			    size);
+++			return 0;
+++		}
+ +		uint32_t cmd = wl_prd(WL_EPCFG + 0x04);
+ +		r[13] = cmd;
+ +		wl_pwr(WL_EPCFG + 0x04, cmd & 0xffffu & ~7u);   /* decode off while moving */
+@@ -714,10 +780,16 @@
+ +	case 16: { /* MHI + BHI, read-only */
+ +		static const uint16_t mo[10] = {0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x2c, 0x30, 0x38, 0x48};
+ +		static const uint16_t bo[8] = {0x00, 0x04, 0x28, 0x2c, 0x30, 0x34, 0x38, 0x3c};
+++		printf("FUXI WLAN: step 16 entered: BAR0 window %#llx wl_ath_enabled=%d wl3_faults=%u fw_faults=%u\n",
+++		    (unsigned long long)WL_BAR0, wl_ath_enabled, wl3_faults, fw_faults);
+++		wl_diag_link_note("step16");
+ +		for (unsigned i = 0; i < 10; i++) {
+ +			r[20 + i] = wl_prd((uint64_t)WL_BAR0 + mo[i]);
+++			printf("FUXI WLAN: step16 MHI read BAR0+%#x -> %#x\n", mo[i], r[20 + i]);
+ +		}
+ +		if (wl3_faults) {
+++			printf("FUXI WLAN: step 16 exit reason 1: MMIO fault during MHI register reads "
+++			    "(wl3_faults=%u fw_faults=%u)\n", wl3_faults, fw_faults);
+ +			return 1;
+ +		}
+ +		uint32_t cfg = r[22], st = r[29], ctrl = r[28], bhi = r[25];
+@@ -729,14 +801,20 @@
+ +		    ctrl, (ctrl >> 8) & 0xffu, (ctrl >> 1) & 1u, st, wl_mhi_state((st >> 8) & 0xffu),
+ +		    st & 1u, (st >> 2) & 1u);
+ +		if (r[20] == 0xffffffffu && r[21] == 0xffffffffu) {
+++			printf("FUXI WLAN: step 16 exit reason 2: BAR0 not decoded / link down "
+++			    "(REGLEN=%#x MHIVER=%#x both all-ones; BAR0 window %#llx unresponsive)\n",
+++			    r[20], r[21], (unsigned long long)WL_BAR0);
+ +			return 2;               /* BAR not decoded / link down */
+ +		}
+ +		if (bhi < 0x40 || bhi > 0x4000u - 0x40u || (bhi & 3)) {
+ +			printf("FUXI WLAN: BHIOFF %#x outside the mapped 16 KiB; BHI not read\n", bhi);
+++			printf("FUXI WLAN: step 16 exit reason 3: BHIOFF %#x invalid: range [0x40, 0x3fc0), 4-aligned\n",
+++			    bhi);
+ +			return 3;
+ +		}
+ +		for (unsigned i = 0; i < 8; i++) {
+ +			r[30 + i] = wl_prd((uint64_t)WL_BAR0 + bhi + bo[i]);
+++			printf("FUXI WLAN: step16 BHI read +%#x -> %#x\n", bo[i], r[30 + i]);
+ +		}
+ +		printf("FUXI WLAN: BHI version %u.%u EXECENV %#x (%s) STATUS %#x (%u) ERRCODE %#x ERRDBG %#x %#x %#x\n",
+ +		    r[31], r[30], r[32], wl_mhi_ee(r[32]), r[33], r[33] >> 30, r[34], r[35], r[36], r[37]);
+@@ -744,6 +822,14 @@
+ +		r[38] = wl_prd(WL_DBI + 0x04);
+ +		r[39] = wl_prd(WL_EPCFG + 0x04);
+ +		printf("FUXI WLAN: RC cmd/status %#x EP cmd/status %#x\n", r[38], r[39]);
+++		wl_diag_cmdstatus("RC-final", r[38]);
+++		wl_diag_cmdstatus("EP-final", r[39]);
+++		if (wl3_faults) {
+++			printf("FUXI WLAN: step 16 exit reason 4: MMIO fault after BHI reads "
+++			    "(wl3_faults=%u fw_faults=%u)\n", wl3_faults, fw_faults);
+++		} else {
+++			printf("FUXI WLAN: step 16 exit reason 0: MHI/BHI snapshot complete (faults 0)\n");
+++		}
+ +		return wl3_faults ? 4 : 0;
+ +	}
+ +	}
+@@ -768,7 +854,6 @@
+ +static struct wl_dma wl_image, wl_vectors, wl_contexts, wl_tables;
+ +static struct wl_dma wl_amss; /* full file when BHI uses a separate prefix */
+ +static struct wl_dma wl_ath_arena;
+-+static bool wl_ath_enabled;
+ +static void wl_ath_release(void);
+ +static bool wl_qrtr, wl_w12, wl_w13, wl_w14, wl_w15, wl_w11_attempted, wl_w11_ok;
+ +static unsigned wl15_variant, wl16_variant, wl12_mlo_variant;
+@@ -2989,6 +3074,60 @@
+ +	return bad;
+ +}
+ +
+++/* v15fwdiag: one-shot path/root-volume decomposition, printed only after the
+++ * retried firmware open still fails. Each successful vnode_lookup holds an
+++ * iocount that is released with vnode_put; read-only, no state change. */
+++static const char *
+++wl_fwdiag_vtype(int t)
+++{
+++	switch (t) {
+++	case VNON: return "VNON";
+++	case VREG: return "VREG";
+++	case VDIR: return "VDIR";
+++	case VBLK: return "VBLK";
+++	case VCHR: return "VCHR";
+++	case VLNK: return "VLNK";
+++	case VSOCK: return "VSOCK";
+++	case VFIFO: return "VFIFO";
+++	case VBAD: return "VBAD";
+++	default: return "?";
+++	}
+++}
+++
+++static void
+++wl_fw_open_diag(const char *path, vfs_context_t ctx)
+++{
+++	static const char *levels[] = {
+++	    "/usr", "/usr/local", "/usr/local/share",
+++	    "/usr/local/share/fuxi", "/usr/local/share/fuxi/wlan",
+++	};
+++	for (unsigned i = 0; i <= 5; i++) {
+++		const char *p = (i < 5) ? levels[i] : path;
+++		vnode_t lp = NULL;
+++		int le = vnode_lookup(p, 0, &lp, ctx);
+++		if (le) {
+++			printf("FUXI WLAN DIAG: path %s lookup errno %d\n", p, le);
+++			continue;
+++		}
+++		printf("FUXI WLAN DIAG: path %s lookup ok vtype %d (%s)\n",
+++		    p, (int)vnode_vtype(lp), wl_fwdiag_vtype(vnode_vtype(lp)));
+++		vnode_put(lp);
+++	}
+++	vnode_t rvp = vfs_rootvnode();
+++	if (!rvp) {
+++		printf("FUXI WLAN DIAG: root vnode unavailable for statfs\n");
+++		return;
+++	}
+++	struct vfsstatfs *sf = vnode_vfsstatfs(rvp);
+++	if (!sf) {
+++		printf("FUXI WLAN DIAG: root statfs unavailable\n");
+++	} else {
+++		printf("FUXI WLAN DIAG: root volume fstype '%s' mntfrom '%s'\n",
+++		    sf->f_fstypename, sf->f_mntfromname);
+++	}
+++	vnode_put(rvp);
+++}
+++
+ +static int
+ +wl_read_firmware(void)
+ +{
+@@ -3002,9 +3141,20 @@
+ +	}
+ +	if (!root) { return 1; }
+ +	vnode_put(root);
+-+	int e = vnode_open(wl_fw_path, FREAD | O_NOFOLLOW | O_NONBLOCK, 0, 0, &vp, ctx);
+++	/* Retry the open for up to 120 s (1200 x 100 ms); the root mount/name
+++	 * space can still be settling at this early boot step. Each wait yields
+++	 * this dedicated WLAN thread only; the main/launchd thread is not blocked.
+++	 * On final failure the one-shot path/volume diagnostic runs once. */
+++	int e = 0;
+++	for (unsigned i = 0; i <= 1200; i++) {
+++		e = vnode_open(wl_fw_path, FREAD | O_NOFOLLOW | O_NONBLOCK, 0, 0, &vp, ctx);
+++		if (!e) { break; }
+++		if (i < 1200) { wl_sleep(100); }
+++	}
+ +	if (e) {
+-+		printf("FUXI WLAN: firmware open failed errno %d\n", e);
+++		printf("FUXI WLAN DIAG: firmware open failed after 120 s retry window (1200 x 100 ms); "
+++		    "last errno %d\n", e);
+++		wl_fw_open_diag(wl_fw_path, ctx);
+ +		return 2;
+ +	}
+ +	struct vnode_attr a;
+@@ -5191,6 +5341,8 @@
+ +static void
+ +wl5_abort(unsigned step)
+ +{
+++	printf("FUXI WLAN: wl5_abort: step=%u limit=%u report[0]=%#x report[3]=%#x faults=%u (containment path)\n",
+++	    step, wl5_report[1], wl5_report[0], wl5_report[3], fw_faults);
+ +	if (wl_w11_attempted) { wl_w11_stop(); }
+ +	wl5_status(step);
+ +	(void)wl_smmu_fault(step);
+@@ -5443,14 +5595,29 @@
+ +			fw_m3_summary(s);
+ +		}
+ +		if (e) {
+++			if (wl_ath_enabled && s < 18) {
+++				printf("FUXI WLAN: ath12k run NOT reached: legacy aborted at step %u before step 18; "
+++				    "wl_ath_run()/PCIe enum skipped\n", s);
+++			}
+ +			r4[3] = s << 8 | (unsigned)e;
+ +			wl5_report[3] = r4[3];
+-+			if (s >= 17 || (wl_seq_flags && s >= 8)) { wl5_abort(s); }
+++			bool abort_called = s >= 17 || (wl_seq_flags && s >= 8);
+++			if (wl_ath_enabled) {
+++				printf("FUXI WLAN: legacy stop: step %u returned reason %u (code %#x); steps 17..18 not "
+++				    "attempted, so wl_ath_run()/PCIe enum were never invoked; wl5_abort containment %s\n",
+++				    s, e, r4[3], abort_called ? "invoked" : "skipped (step below abort threshold)");
+++			}
+++			printf("FUXI WLAN: m6 report snapshot: magic %#x limit %u last step %u code %#x (reason %u); "
+++			    "magic is the pre-run WL5 header, not a stage error\n",
+++			    wl5_report[0], wl5_report[1], wl5_report[2], wl5_report[3], e);
+++			if (abort_called) { wl5_abort(s); }
+ +			printf("FUXI WLAN: stopped at step %u reason %u ESR %#x FAR %#llx; reboot to retry\n",
+ +			    s, e, fw_fault_esr, fw_fault_far);
+ +			goto out;
+ +		}
+ +		if (wl_ath_enabled && s == 18) {
+++			printf("FUXI WLAN: ath12k run reached step %u; invoking wl_ath_run (wl_ath_enabled=%d)\n",
+++			    s, wl_ath_enabled);
+ +			int native_error = wl_ath_run();
+ +			printf("FUXI WLAN: ath12k diagnostic result %d; legacy steps 19..28 skipped\n", native_error);
+ +			wl5_abort(18);
+@@ -6340,7 +6507,7 @@
+ +#endif
+ --- /dev/null
+ +++ b/bsd/dev/fuxi_wlan_ath12k.inc
+-@@ -0,0 +1,434 @@
++@@ -0,0 +1,852 @@
+ +#include "fuxi_wlan_arena.h"
+ +#include "fuxi_wlan_ath12k.h"
+ +#include "fuxi_wlan_control.h"
+@@ -6348,18 +6515,41 @@
+ +
+ +#define WLA_BYTES (128u << 20)
+ +#define WLA_BLOCKS 16384u
+++/* Bounded boot budgets: a stuck PBL must never hold the WLAN thread past these
+++ * windows; on expiry the glue stops the module and falls back to today's
+++ * containment instead of hanging boot. */
+++#define WLA_ROOT_WAIT_MS 120000u
+++#define WLA_READY_BUDGET_MS 20000u
+++/* Primary root-volume firmware directory; the fallback is the bindfs/preboot
+++ * standalone firmware clue. Each candidate is opened and reported on its own,
+++ * so a missing primary and a missing fallback cannot be merged into one -1. */
+++#define WLA_FW_PRIMARY_DIR "/usr/local/share/fuxi/wlan"
+++#define WLA_FW_FALLBACK_DIR "/usr/standalone/firmware"
+++/* PCIe PARF/DBI windows, matching the legacy bring-up constants. */
+++#define WLA_PARF_PA 0x01c00000ull
+++#define WLA_DBI_PA 0x60000000ull
+++#define WLA_BAR0_WINDOW 0x4000u
+++/* Expected WCN7850 PCI identifiers. */
+++#define WLA_PCI_VENDOR 0x17cbu
+++#define WLA_PCI_DEVICE 0x1107u
+ +static struct fwa_arena wla_pool;
+ +static struct fwa_block *wla_blocks;
+ +static unsigned wla_express, wla_msi, wla_failed;
+++static bool wla_root_waited, wla_probed;
+++/* BAR0 base/size are filled only by config-space enumeration and BAR
+++ * allocation; there is no constant fallback base. */
+++static uint64_t wla_bar0_pa;
+++static size_t wla_bar0_size;
+ +static struct {
+ +	const char *name, *file;
+++	uint64_t expected;
+ +	void *memory;
+ +	size_t bytes;
+ +} wla_firmware[] = {
+-+	{"amss.bin", "amss20.bin", NULL, 0},
+-+	{"m3.bin", "m3.bin", NULL, 0},
+-+	{"board-2.bin", "board-2.bin", NULL, 0},
+-+	{"regdb.bin", "regdb_xiaomi.bin", NULL, 0},
+++	{"amss.bin", "amss20.bin", 6090816ull, NULL, 0},
+++	{"m3.bin", "m3.bin", 299660ull, NULL, 0},
+++	{"board-2.bin", "board-2.bin", 2431968ull, NULL, 0},
+++	{"regdb.bin", "regdb_xiaomi.bin", 0, NULL, 0},
+ +};
+ +
+ +static uint64_t
+@@ -6374,6 +6564,49 @@
+ +wla_now_ms(void)
+ +{
+ +	return wla_now_ns() / 1000000ull;
+++}
+++
+++/* The firmware files live on the root volume; before the first open, wait for
+++ * it like the legacy diagnostic path does. One wait per boot; failure is
+++ * reported with the budget in milliseconds so a slow mount is distinguished
+++ * from a missing image. */
+++static int
+++wla_wait_root(void)
+++{
+++	if (wla_root_waited) { return 0; }
+++	uint64_t deadline = wla_now_ms() + WLA_ROOT_WAIT_MS;
+++	for (;;) {
+++		vnode_t root = vfs_rootvnode();
+++		if (root) {
+++			vnode_put(root);
+++			wla_root_waited = true;
+++			return 0;
+++		}
+++		if (wla_now_ms() >= deadline) {
+++			printf("FUXI ATH12K: root volume not mounted within %u ms; firmware fetch deferred\n",
+++			    WLA_ROOT_WAIT_MS);
+++			return -1;
+++		}
+++		wl_sleep(100);
+++	}
+++}
+++
+++/* Snapshot the fault-contained MHI/BHI registers. Reads only; on a fault the
+++ * caller skips the watch so an inaccessible BAR cannot be mistaken for PBL. */
+++static void
+++wla_mhi_snapshot(const char *phase)
+++{
+++	if (!wl_mhi_valid || fw_faults) { return; }
+++	uint32_t ver = wl_mrd(0x08);
+++	uint32_t cfg = wl_mrd(0x10);
+++	uint32_t ee = wl_mrd(wl_bhi + 0x28);
+++	uint32_t status = wl_mrd(0x48);
+++	uint32_t ctrl = wl_mrd(0x38);
+++	uint32_t bhi = wl_mrd(wl_bhi + 0x2c);
+++	if (fw_faults) { return; }
+++	printf("FUXI ATH12K: MHI %s MHIVER %#x MHICFG %#x EE %#x (%s) MHISTATUS %#x "
+++	    "(state %s ready %u) MHICTRL %#x BHI %#x\n", phase, ver, cfg, ee,
+++	    wl_mhi_ee(ee), status, wl_mhi_state((status >> 8) & 255), status & 1, ctrl, bhi);
+ +}
+ +
+ +static void *
+@@ -6456,6 +6689,99 @@
+ +		return;
+ +	}
+ +	__asm__ volatile("dsb sy" ::: "memory");
+++}
+++
+++/* Open one absolute firmware path, getattr, allocate, read, close. On
+++ * success returns 0 and hands out the block and size; every failure stage keeps the
+++ * raw open errno, and the absolute path is printed with the line. Synthetic
+++ * stages: -2 getattr/type/size, -3 allocation, -4 read residual. */
+++static int
+++wla_fw_open_at(const char *base, const char *file, const char *path,
+++    void **memory, uint64_t *size, int *residual)
+++{
+++	vnode_t filev = NULL;
+++	vfs_context_t context = vfs_context_kernel();
+++	*memory = NULL;
+++	*size = 0;
+++	*residual = 0;
+++	int error = vnode_open(path, FREAD | O_NOFOLLOW | O_NONBLOCK, 0, 0, &filev, context);
+++	struct vnode_attr attributes;
+++	VATTR_INIT(&attributes);
+++	VATTR_WANTED(&attributes, va_data_size);
+++	if (!error) {
+++		error = vnode_getattr(filev, &attributes, context);
+++		if (!error && (vnode_vtype(filev) != VREG ||
+++		    !VATTR_IS_SUPPORTED(&attributes, va_data_size) ||
+++		    !attributes.va_data_size || attributes.va_data_size > WL_FW_MAX)) { error = -2; }
+++		*size = (uint64_t)attributes.va_data_size;
+++	}
+++	void *block = (!error ? wla_alloc((size_t)*size) : NULL);
+++	if (!block) { error = error ? error : -3; }
+++	if (!error) {
+++		error = vn_rdwr(UIO_READ, filev, (caddr_t)block, (int)*size, 0,
+++		    UIO_SYSSPACE, 0, vfs_context_ucred(context), residual, vfs_context_proc(context));
+++		if (*residual) { error = -4; }
+++	}
+++	int close_error = filev ? vnode_close(filev, FREAD, context) : 0;
+++	if (error) {
+++		wla_free(block);
+++		if (close_error) {
+++			printf("FUXI ATH12K: firmware %s (%s) close failed path %s errno %d\n",
+++			    base, file, path, close_error);
+++		}
+++		printf("FUXI ATH12K: firmware %s (%s) path %s unavailable stage %d errno %d "
+++		    "residual %d size %llu\n", base, file, path, error,
+++		    error > 0 ? error : 0, *residual, *size);
+++		return -1;
+++	}
+++	*memory = block;
+++	return 0;
+++}
+++
+++/* One-shot directory/file stat probe before the firmware retry loop: separate
+++ * "directory not visible" from "present but wrong size", with the expected
+++ * reference sizes for the three shipped images. */
+++static void
+++wla_fw_probe(void)
+++{
+++	if (wla_probed) { return; }
+++	wla_probed = true;
+++	vfs_context_t context = vfs_context_kernel();
+++	char path[128];
+++	snprintf(path, sizeof(path), "%s", WLA_FW_PRIMARY_DIR);
+++	vnode_t dir = NULL;
+++	int open_err = vnode_open(path, FREAD | O_NOFOLLOW | O_NONBLOCK, 0, 0, &dir, context);
+++	int attr_err = 0;
+++	uint64_t dir_size = 0;
+++	if (!open_err) {
+++		struct vnode_attr attributes;
+++		VATTR_INIT(&attributes);
+++		VATTR_WANTED(&attributes, va_data_size);
+++		attr_err = vnode_getattr(dir, &attributes, context);
+++		if (!attr_err) { dir_size = (uint64_t)attributes.va_data_size; }
+++		vnode_close(dir, FREAD, context);
+++	}
+++	printf("FUXI ATH12K: firmware dir %s open errno %d getattr errno %d visible %s size %llu\n",
+++	    path, open_err, attr_err, open_err || attr_err ? "no" : "yes", dir_size);
+++	for (unsigned index = 0; index < sizeof(wla_firmware) / sizeof(wla_firmware[0]); index++) {
+++		snprintf(path, sizeof(path), "%s/%s", WLA_FW_PRIMARY_DIR,
+++		    wla_firmware[index].file);
+++		vnode_t filev = NULL;
+++		int e = vnode_open(path, FREAD | O_NOFOLLOW | O_NONBLOCK, 0, 0, &filev, context);
+++		uint64_t size = 0;
+++		int gerr = 0;
+++		if (!e) {
+++			struct vnode_attr attributes;
+++			VATTR_INIT(&attributes);
+++			VATTR_WANTED(&attributes, va_data_size);
+++			gerr = vnode_getattr(filev, &attributes, context);
+++			if (!gerr) { size = (uint64_t)attributes.va_data_size; }
+++			vnode_close(filev, FREAD, context);
+++		}
+++		printf("FUXI ATH12K: probe %s (%s) path %s size %llu errno %d expected %llu\n",
+++		    wla_firmware[index].name, wla_firmware[index].file, path, size, e,
+++		    (unsigned long long)wla_firmware[index].expected);
+++	}
+ +}
+ +
+ +static int
+@@ -6486,35 +6812,28 @@
+ +	}
+ +	if (index == sizeof(wla_firmware) / sizeof(wla_firmware[0])) { return -1; }
+ +	if (!wla_firmware[index].memory) {
+-+		char path[128];
+-+		vnode_t file = NULL;
+-+		vfs_context_t context = vfs_context_kernel();
+-+		snprintf(path, sizeof(path), "/usr/local/share/fuxi/wlan/%s", wla_firmware[index].file);
+-+		int error = vnode_open(path, FREAD | O_NOFOLLOW | O_NONBLOCK, 0, 0, &file, context);
+-+		if (error) { return -1; }
+-+		struct vnode_attr attributes;
+-+		VATTR_INIT(&attributes);
+-+		VATTR_WANTED(&attributes, va_data_size);
+-+		error = vnode_getattr(file, &attributes, context);
+-+		if (error || vnode_vtype(file) != VREG || !VATTR_IS_SUPPORTED(&attributes, va_data_size) ||
+-+		    !attributes.va_data_size || attributes.va_data_size > WL_FW_MAX) { error = -1; }
+-+		void *memory = error ? NULL : wla_alloc((size_t)attributes.va_data_size);
+-+		if (!memory) { error = -1; }
+-+		if (!error) {
+-+			int residual = 0;
+-+			error = vn_rdwr(UIO_READ, file, (caddr_t)memory, (int)attributes.va_data_size, 0,
+-+			    UIO_SYSSPACE, 0, vfs_context_ucred(context), &residual, vfs_context_proc(context));
+-+			if (residual) { error = -1; }
+-+		}
+-+		if (vnode_close(file, FREAD, context)) { error = -1; }
+-+		if (error) {
+-+			wla_free(memory);
+++		char primary[128], fallback[128];
+++		void *memory = NULL;
+++		uint64_t size = 0;
+++		int residual = 0;
+++		if (wla_wait_root()) { return -1; }
+++		snprintf(primary, sizeof(primary), "%s/%s", WLA_FW_PRIMARY_DIR,
+++		    wla_firmware[index].file);
+++		snprintf(fallback, sizeof(fallback), "%s/%s", WLA_FW_FALLBACK_DIR,
+++		    wla_firmware[index].file);
+++		/* Primary first; only then the bindfs/preboot clue. Each candidate
+++		 * logs its own absolute path and stage/errno, never merged into -1. */
+++		if (wla_fw_open_at(base, wla_firmware[index].file, primary,
+++		    &memory, &size, &residual) ||
+++		    wla_fw_open_at(base, wla_firmware[index].file, fallback,
+++		    &memory, &size, &residual)) {
+ +			return -1;
+ +		}
+ +		wla_firmware[index].memory = memory;
+-+		wla_firmware[index].bytes = (size_t)attributes.va_data_size;
+-+		printf("FUXI ATH12K: firmware %s from %s bytes %llu\n", base,
+-+		    wla_firmware[index].file, (uint64_t)wla_firmware[index].bytes);
+++		wla_firmware[index].bytes = (size_t)size;
+++		printf("FUXI ATH12K: firmware %s loaded from %s bytes %llu expected %llu\n",
+++		    base, wla_firmware[index].file, (uint64_t)wla_firmware[index].bytes,
+++		    (unsigned long long)wla_firmware[index].expected);
+ +	}
+ +	*data = wla_firmware[index].memory;
+ +	*bytes = wla_firmware[index].bytes;
+@@ -6565,12 +6884,227 @@
+ +	return 0;
+ +}
+ +
+++/* ---- v23diag: observation-only dumps. No judgment, return value, or state
+++ * change here; these only log what the ADT and iATU currently expose. ---- */
+++
+++/* Probe candidate PCIe/WiFi ADT nodes and their common aperture/iommu
+++ * properties. Missing node or missing property is logged as absent, not
+++ * treated as an error. */
+++static void
+++wla_adt_pcie_diag(void)
+++{
+++	static const char *nodes[] = {
+++	    "/chosen", "/pcie0", "/pcie", "/soc/pcie0", "/soc/pcie", "/wifi0"
+++	};
+++	static const char *props[] = {
+++	    "compatible", "status", "ranges", "reg", "iommu",
+++	    "dma-coherent", "msi-parent", "mac-address-wifi0"
+++	};
+++	for (unsigned ni = 0; ni < sizeof(nodes) / sizeof(nodes[0]); ni++) {
+++		DTEntry node;
+++		int lr = SecureDTLookupEntry(NULL, nodes[ni], &node);
+++		if (lr != kSuccess) {
+++			printf("FUXI ATH12K: ADT node %s lookup absent (err %d)\n", nodes[ni], lr);
+++			continue;
+++		}
+++		printf("FUXI ATH12K: ADT node %s lookup ok\n", nodes[ni]);
+++		for (unsigned pi = 0; pi < sizeof(props) / sizeof(props[0]); pi++) {
+++			const void *val = NULL;
+++			unsigned len = 0;
+++			int pr = SecureDTGetProperty(node, props[pi], &val, &len);
+++			if (pr != kSuccess || val == NULL || len == 0) {
+++				printf("FUXI ATH12K: ADT   %s/%s absent\n", nodes[ni], props[pi]);
+++				continue;
+++			}
+++			uint32_t word = 0;
+++			const uint8_t *bytes = (const uint8_t *)val;
+++			for (unsigned b = 0; b < len && b < 4; b++) { word |= (uint32_t)bytes[b] << (8 * b); }
+++			printf("FUXI ATH12K: ADT   %s/%s len %u first %#x\n",
+++			    nodes[ni], props[pi], len, word);
+++		}
+++	}
+++}
+++
+++/* Read back the outbound/inbound iATU region registers. Synopsys DWC layout:
+++ * +0x00 region type, +0x04 control (enable bit31), +0x08 lower base,
+++ * +0x0c lower base high, +0x10 limit, +0x14 target lower, +0x18 target high,
+++ * +0x1c, +0x20. Region n sits at DBI + 0x1000 (OB) / 0x1100 (IB) + n*0x200. */
+++static void
+++wla_atu_diag(void)
+++{
+++	static const struct { const char *dir; unsigned slot; uint64_t base; } atu[] = {
+++	    { "OB", 0, WLA_DBI_PA + 0x1000ull },
+++	    { "OB", 1, WL_ATU1 },
+++	    { "IB", 1, WLA_DBI_PA + 0x1100ull + 0x200ull }
+++	};
+++	static const uint16_t offs[] = { 0x00, 0x04, 0x08, 0x0c, 0x10, 0x14, 0x18, 0x1c, 0x20 };
+++	for (unsigned a = 0; a < sizeof(atu) / sizeof(atu[0]); a++) {
+++		for (unsigned o = 0; o < sizeof(offs) / sizeof(offs[0]); o++) {
+++			uint32_t v = wl_prd(atu[a].base + offs[o]);
+++			printf("FUXI ATH12K: iATU %s slot %u base %#llx +%#03x = %#x\n",
+++			    atu[a].dir, atu[a].slot, (unsigned long long)atu[a].base, offs[o], v);
+++		}
+++	}
+++}
+++
+++/* PCIe config-space enumeration for the WCN7850. The config window base is
+++ * the legacy glue ECAM/CFG0 aperture (WL_EPCFG); this glue parses no ADT
+++ * property for it. BAR0 base is never filled from a constant: it comes either
+++ * from the device's programmed BAR or from the allocation below. All accesses
+++ * stay fault-contained; any failure returns nonzero for the existing
+++ * containment path. */
+++static int
+++wla_pcie_enumerate(void)
+++{
+++	printf("FUXI ATH12K: wla_pcie_enumerate() entered (caller wl_ath_run); "
+++	    "wl_ath_enabled=%d bar0_pa=%#llx bar0_size=%#x fw_faults=%u\n",
+++	    wl_ath_enabled, (unsigned long long)wla_bar0_pa,
+++	    (uint32_t)wla_bar0_size, fw_faults);
+++	wla_adt_pcie_diag();
+++	wla_atu_diag();
+++	/* The legacy iATU CFG0 region exposes one endpoint (bus 0/dev 0/fn 0);
+++	 * there is no per-BDF decode on this window. The scan range is logged. */
+++	const unsigned bus = 0, dev = 0, fn = 0;
+++	uint32_t id = wl_prd(WL_EPCFG);
+++	uint32_t classrev = wl_prd(WL_EPCFG + 0x08);
+++	uint32_t htype = wl_prd(WL_EPCFG + 0x0e) & 0xffu;
+++	uint16_t vendor = id & 0xffffu, device = id >> 16;
+++	uint32_t class_code = (classrev >> 16) & 0xffffu;
+++	printf("FUXI ATH12K: PCIe enum config window PA %#llx; BDF %u:%u.%u id %#x vendor %#x "
+++	    "device %#x class %#x header %#x candidates 1\n",
+++	    (unsigned long long)WL_EPCFG, bus, dev, fn, id, vendor, device,
+++	    class_code, htype);
+++	if (fw_faults || vendor != WLA_PCI_VENDOR || device != WLA_PCI_DEVICE) {
+++		printf("FUXI ATH12K: PCIe enum: no WCN7850 (expected vendor %#x device %#x class %#x; "
+++		    "actual vendor %#x device %#x class %#x header %#x); fall back to containment\n",
+++		    WLA_PCI_VENDOR, WLA_PCI_DEVICE, 0x280u,
+++		    vendor, device, class_code, htype);
+++		printf("FUXI ATH12K: enum exit: no matching EP (fw_faults=%u, vendor/device mismatch)\n",
+++		    fw_faults);
+++		return 1;
+++	}
+++	/* BAR0 sizing: clear MEM decode, write all ones, read back, restore the
+++	 * original BAR before the allocation attempt. */
+++	uint32_t cmd = wl_prd(WL_EPCFG + 0x04);
+++	uint32_t orig_lo = wl_prd(WL_EPCFG + 0x10);
+++	uint32_t orig_hi = wl_prd(WL_EPCFG + 0x14);
+++	wl_pwr(WL_EPCFG + 0x04, cmd & 0xffffu & ~7u);
+++	wl_pwr(WL_EPCFG + 0x10, 0xffffffffu);
+++	wl_pwr(WL_EPCFG + 0x14, 0xffffffffu);
+++	uint32_t size_lo = wl_prd(WL_EPCFG + 0x10);
+++	uint32_t size_hi = wl_prd(WL_EPCFG + 0x14);
+++	wl_pwr(WL_EPCFG + 0x10, orig_lo);
+++	wl_pwr(WL_EPCFG + 0x14, orig_hi);
+++	printf("FUXI ATH12K: BAR0 orig %#x/%#x sizing %#x/%#x\n",
+++	    orig_lo, orig_hi, size_lo, size_hi);
+++	if ((size_lo & 0xfu) != 0x4u || size_hi != 0xffffffffu) {
+++		printf("FUXI ATH12K: BAR0 is not a 32-bit MEM BAR (low %#x upper %#x); containment\n",
+++		    size_lo, size_hi);
+++		printf("FUXI ATH12K: enum exit: BAR0 not a 32-bit MEM BAR\n");
+++		return 1;
+++	}
+++	uint32_t size = ~(size_lo & ~0xfu) + 1u;
+++	if (!size || size > 0x200000u || (size & (size - 1))) {
+++		printf("FUXI ATH12K: BAR0 size %#x out of range or not power-of-two; containment\n", size);
+++		printf("FUXI ATH12K: enum exit: BAR0 size invalid\n");
+++		return 1;
+++	}
+++	/* Allocate a size-aligned slot inside the legacy iATU MEM aperture,
+++	 * skipping the fixed DBI/config/sliding-window regions (interval
+++	 * overlap, not base-only). */
+++	uint64_t candidate = 0;
+++	const uint64_t reserved[] = {
+++	    WLA_DBI_PA, WLA_DBI_PA + 0x4000u,
+++	    WL_EPCFG, WL_EPCFG + 0x4000u,
+++	    0x60480000ull, 0x60480000ull + 0x80000u
+++	};
+++	for (uint64_t slot = WL_MEM_LO; slot + size <= WL_MEM_HI + 1ull; slot += size) {
+++		bool overlap = false;
+++		for (unsigned k = 0; k < sizeof(reserved) / sizeof(reserved[0]); k += 2) {
+++			if (slot < reserved[k + 1] && slot + size > reserved[k]) { overlap = true; break; }
+++		}
+++		if (!overlap) { candidate = slot; break; }
+++	}
+++	if (!candidate) {
+++		printf("FUXI ATH12K: BAR0 no free slot in aperture %#llx-%#llx; containment\n",
+++		    (unsigned long long)WL_MEM_LO, (unsigned long long)WL_MEM_HI);
+++		printf("FUXI ATH12K: enum exit: no free slot in MEM aperture\n");
+++		return 1;
+++	}
+++	wl_pwr(WL_EPCFG + 0x10, (uint32_t)candidate);
+++	wl_pwr(WL_EPCFG + 0x14, 0);
+++	uint32_t rb_lo = wl_prd(WL_EPCFG + 0x10);
+++	uint32_t rb_hi = wl_prd(WL_EPCFG + 0x14);
+++	printf("FUXI ATH12K: BAR0 assigned %#llx readback %#x/%#x\n",
+++	    (unsigned long long)candidate, rb_lo, rb_hi);
+++	if ((rb_lo & ~0xfu) != (uint32_t)candidate || rb_hi != 0) {
+++		wl_pwr(WL_EPCFG + 0x10, orig_lo);
+++		wl_pwr(WL_EPCFG + 0x14, orig_hi);
+++		printf("FUXI ATH12K: BAR0 assignment readback mismatch; link/ECAM not decoded; containment\n");
+++		printf("FUXI ATH12K: enum exit: BAR0 write readback mismatch\n");
+++		return 1;
+++	}
+++	wl_pwr(WL_EPCFG + 0x04, (cmd & 0xffffu & ~7u) | 2u);
+++	uint32_t cmd_rb = wl_prd(WL_EPCFG + 0x04);
+++	if (!(cmd_rb & 2u)) {
+++		printf("FUXI ATH12K: BAR0 MEM enable not confirmed (cmd/status %#x); containment\n", cmd_rb);
+++		printf("FUXI ATH12K: enum exit: MEM enable not confirmed\n");
+++		return 1;
+++	}
+++	wla_bar0_pa = candidate;
+++	wla_bar0_size = size;
+++	printf("FUXI ATH12K: BAR0 allocated base %#llx size %#x MEM enable confirmed\n",
+++	    (unsigned long long)wla_bar0_pa, (uint32_t)wla_bar0_size);
+++	printf("FUXI ATH12K: enum exit: success, BAR0 owned by enumeration\n");
+++	return 0;
+++}
+++
+ +static void *
+ +wla_map_phys(uint64_t address, size_t bytes)
+ +{
+-+	if (!bytes || address < WL_BAR0 || address - WL_BAR0 >= 0x200000 ||
+-+	    bytes > 0x200000 - (address - WL_BAR0)) { return NULL; }
+-+	return (void *)(fw_va(WL_BAR0) + (address - WL_BAR0));
+++	if (!bytes || !wla_bar0_pa || address < wla_bar0_pa ||
+++	    address - wla_bar0_pa >= wla_bar0_size ||
+++	    bytes > wla_bar0_size - (address - wla_bar0_pa)) { return NULL; }
+++	return (void *)(fw_va(wla_bar0_pa) + (address - wla_bar0_pa));
+++}
+++
+++/* Validate the host BAR0 window before any firmware download. Log the BAR0 PA,
+++ * mapped VA, window length and a write/read-back probe. If MHIVER reads a poison
+++ * fill (0, all-ones, or a 0xdead-prefixed sentinel) the window is treated as
+++ * not really mapped: dump the PCIe side and return failure so the caller falls
+++ * back to containment instead of driving a dead device through the MHI sequence. */
+++static int
+++wla_bar0_probe(void)
+++{
+++	if (!wla_bar0_pa) {
+++		printf("FUXI ATH12K: BAR0 probe skipped: no enumerated/assigned base; containment\n");
+++		return 1;
+++	}
+++	uintptr_t va = (uintptr_t)fw_va(wla_bar0_pa);
+++	printf("FUXI ATH12K: BAR0 window PA %#llx VA %p host window %#x barlen %#x\n",
+++	    (unsigned long long)wla_bar0_pa, (void *)va, WLA_BAR0_WINDOW,
+++	    (uint32_t)wla_bar0_size);
+++	uint32_t hiver = wl_prd(wla_bar0_pa + 0x08);
+++	uint32_t hicfg = wl_prd(wla_bar0_pa + 0x10);
+++	wl_pwr(wla_bar0_pa + 0x38, 0);
+++	uint32_t ctrl_rb = wl_prd(wla_bar0_pa + 0x38);
+++	printf("FUXI ATH12K: BAR0 write probe off 0x38 wrote 0 readback %#x MHIVER %#x MHICFG %#x\n",
+++	    ctrl_rb, hiver, hicfg);
+++	bool poison = !va || fw_faults || hiver == 0 || hiver == ~0u || (hiver >> 16) == 0xdead;
+++	if (!poison) {
+++		printf("FUXI ATH12K: BAR0 mapping looks live; proceed to firmware download\n");
+++		return 0;
+++	}
+++	uint32_t id = wl_prd(WL_EPCFG);
+++	uint32_t cmd = wl_prd(WL_EPCFG + 4);
+++	uint32_t ltssm = wl_prd(WLA_PARF_PA + 0x1b0);
+++	uint32_t dbi4 = wl_prd(WLA_DBI_PA + 4);
+++	printf("FUXI ATH12K: PCIe EP id %#x vendor %#x device %#x cmd %#x LTSSM %#x DBI+4 %#x\n",
+++	    id, id & 0xffffu, id >> 16, cmd, ltssm, dbi4);
+++	printf("FUXI ATH12K: BAR0 at %#llx is not really mapped/placeholder (MHIVER %#x); "
+++	    "skip firmware download, fall back to containment\n",
+++	    (unsigned long long)wla_bar0_pa, hiver);
+++	return 1;
+ +}
+ +
+ +static void
+@@ -6673,20 +7207,43 @@
+ +		return 6;
+ +	}
+ +	printf("FUXI ATH12K: %s control transport installed\n", ios ? "iOS native" : "diagnostic");
+++	printf("FUXI ATH12K: wl_ath_run() entered; ios=%d wl_ath_enabled=%d fw_faults=%u; "
+++	    "pre-enumeration caps check next\n", ios, wl_ath_enabled, fw_faults);
+ +	uint32_t flags = 0;
+ +	wla_express = wl_diag_cap(WL_EPCFG, 0x10, false, &flags);
+ +	wla_msi = wl_diag_cap(WL_EPCFG, 5, false, &flags);
+ +	if (!wla_express || !wla_msi || flags || fw_faults || !wla_available() ||
+ +	    wl_prd(WL_EPCFG) != 0x110717cb || (wl_prd(WL_EPCFG + 4) & 4) ||
+-+	    wl_mrd(wl_bhi + 0x28) != 0 || wl_disable_irqs() || wl_download_aspm()) { return 1; }
+++	    wl_mrd(wl_bhi + 0x28) != 0 || wl_disable_irqs() || wl_download_aspm()) {
+++		printf("FUXI ATH12K: wl_ath_run precheck failed before enumeration "
+++		    "(express=%u msi=%u flags=%#x faults=%u avail=%u ep_id=%#x bad_cmd=%u ee=%#x); "
+++		    "enum not reached\n",
+++		    wla_express, wla_msi, flags, fw_faults, wla_available(),
+++		    wl_prd(WL_EPCFG), (wl_prd(WL_EPCFG + 4) & 4), wl_mrd(wl_bhi + 0x28));
+++		return 1;
+++	}
+++	if (wla_pcie_enumerate() || wla_bar0_probe()) { return 1; }
+++	wla_fw_probe();
+ +	const uint8_t *data;
+ +	size_t bytes;
+++	uint64_t fw_start = wla_now_ms();
+ +	for (unsigned attempt = 0; attempt < 1200; attempt++) {
+ +		if (!wla_fw_get("amss.bin", &data, &bytes) &&
+ +		    !wla_fw_get("m3.bin", &data, &bytes) &&
+ +		    !wla_fw_get("board-2.bin", &data, &bytes)) { break; }
+-+		if (attempt == 1199) { return 2; }
+++		if (attempt == 1199) {
+++			printf("FUXI ATH12K: firmware cache incomplete after %llu ms; stop before module start, contain\n",
+++			    (unsigned long long)(wla_now_ms() - fw_start));
+++			return 2;
+++		}
+ +		wl_sleep(100);
+++	}
+++	for (unsigned index = 0; index < sizeof(wla_firmware) / sizeof(wla_firmware[0]); index++) {
+++		if (wla_firmware[index].memory) {
+++			printf("FUXI ATH12K: cached firmware %s -> %s bytes %llu\n",
+++			    wla_firmware[index].name, wla_firmware[index].file,
+++			    (uint64_t)wla_firmware[index].bytes);
+++		}
+ +	}
+ +	uint64_t alignment = WLA_BYTES;
+ +	wl_iova_next = (wl_iova_next + alignment - 1) & ~(alignment - 1);
+@@ -6695,23 +7252,51 @@
+ +	    fwa_init(&wla_pool, (void *)wl_ath_arena.va, wl_ath_arena.iova, WLA_BYTES, wla_blocks, WLA_BLOCKS) ||
+ +	    wl_smmu_enable() || wl_smmu_fault(18) || wl_rc_check()) { return 3; }
+ +	board = (struct nw_board){
+-+		(void *)fw_va(WL_BAR0), 0x200000, 0x1107, (uint16_t)wla_msi, 1000,
+++		(void *)fw_va(wla_bar0_pa), wla_bar0_size, 0x1107, (uint16_t)wla_msi, 1000,
+ +		wla_cfg_read, wla_cfg_write, wla_msi_target, wla_map_phys, 0
+ +	};
+ +	wl_pwr(WL_EPCFG + 4, (wl_prd(WL_EPCFG + 4) & 0xffff) | 0x406);
+ +	if (fw_faults || (wl_prd(WL_EPCFG + 4) & 0x406) != 0x406) { return 4; }
+ +	printf("FUXI ATH12K: start from PBL, full BAR, owned 128 MiB DMA, IRQ polling; legacy MHI skipped\n");
+++	wla_mhi_snapshot("pre-start PBL");
+ +	nw_wifi_irq_mode(0);
+ +	int error = nw_wifi_start(&platform, &board);
+-+	bool attached = false, completed = false;
+++	bool attached = false, completed = false, ready_seen = false;
+ +	uint64_t started = wla_now_ms(), report = started;
+ +	unsigned spins = 0;
+++	uint32_t ee_last = 0xffffffffu;
+++	if (!error) { wla_mhi_snapshot("module started"); }
+ +	while (!error && !fw_faults && !wla_failed && !wla_control.error &&
+ +	    ((ios && wli.published) || wla_now_ms() - started < 90000)) {
+ +		wla_control_awake = 0;
+ +		/* nonzero while frames move: go round again without sleeping, but not for ever */
+ +		int moving = nw_wifi_step();
+ +		uint64_t now = wla_now_ms();
+++		if (wl_mhi_valid && !fw_faults) {
+++			uint32_t status = wl_mrd(0x48);
+++			uint32_t ee = wl_mrd(wl_bhi + 0x28);
+++			if (!fw_faults) {
+++				bool ready = status & 1u;
+++				if (ready && !ready_seen) {
+++					ready_seen = true;
+++					printf("FUXI ATH12K: MHI READY observed after %llu ms; state %s EE %s\n",
+++					    (unsigned long long)(now - started),
+++					    wl_mhi_state((status >> 8) & 255), wl_mhi_ee(ee));
+++				}
+++				if (ee != ee_last) {
+++					printf("FUXI ATH12K: EE %#x (%s) after %llu ms\n", ee,
+++					    wl_mhi_ee(ee), (unsigned long long)(now - started));
+++					ee_last = ee;
+++				}
+++				if (!ready_seen && now - started >= WLA_READY_BUDGET_MS) {
+++					printf("FUXI ATH12K: MHI READY not observed within %u ms "
+++					    "(MHISTATUS %#x EE %#x); stop module, fall back to containment\n",
+++					    WLA_READY_BUDGET_MS, status, ee);
+++					error = -1;
+++					break;
+++				}
+++			}
+++		}
+ +		if (!attached && nw_wifi_stats.stage >= 4) {
+ +			error = nw_wifi_control_attach(ios ? &wli.session : &wla_control.session);
+ +			attached = !error;
