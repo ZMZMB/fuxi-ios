@@ -950,7 +950,7 @@
                s->release();
                return false;
               }
-@@ -1425,6 +1773,125 @@
+@@ -1425,6 +1773,126 @@
  		s->release();
  	}
  #if defined(FUXI)
@@ -974,6 +974,7 @@
 +			if (ckind == 1) {
 +				const struct sweet_surface_plane *p0 = &pull->planes[0];
 +				const struct sweet_surface_plane *p1 = &pull->planes[1];
++				const uint8_t *srcBase = (const uint8_t *)(uintptr_t)src;
 +				ok = ok && pull->planeCount == 2 && p0->bytesPerRow > 0 && p1->bytesPerRow > 0;
 +				if (ok) {
 +					uint64_t p0end = p0->offset + (uint64_t)(rows - 1) * p0->bytesPerRow + (uint64_t)cols * 4;
@@ -982,8 +983,8 @@
 +				}
 +				if (ok) {
 +					for (uint32_t y = 0; y < rows; y++) {
-+						const uint32_t *row0 = (const uint32_t *)(src + p0->offset + (uint64_t)y * p0->bytesPerRow);
-+						const uint8_t *row1 = src + p1->offset + (uint64_t)y * p1->bytesPerRow;
++						const uint32_t *row0 = (const uint32_t *)(srcBase + p0->offset + (uint64_t)y * p0->bytesPerRow);
++						const uint8_t *row1 = srcBase + p1->offset + (uint64_t)y * p1->bytesPerRow;
 +						volatile uint32_t *out = (volatile uint32_t *)(fPixels + (uint64_t)y * fRowBytes);
 +						for (uint32_t x = 0; x < cols; x++) {
 +							uint32_t word;
@@ -1076,7 +1077,7 @@
   fCpuFrames += cpuFrame;
   if (!gpuFrame) {
    fStage[3] = fStage[4] = mach_absolute_time();
-@@ -1432,6 +1899,14 @@
+@@ -1432,6 +1900,14 @@
    completePresent(mach_absolute_time() - t0);
    if (cpuFrame) scanoutLog(false, cpuBytes, cpuTicks, 0);
   }
@@ -1091,7 +1092,7 @@
  #endif
   return true;
  }
-@@ -1809,10 +2284,17 @@
+@@ -1809,10 +2285,17 @@
  	uint32_t outCount = 0;
  
  	switch (selector) {
