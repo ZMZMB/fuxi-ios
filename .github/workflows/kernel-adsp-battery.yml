@@ -15,6 +15,9 @@ on:
       ath12k:
         type: boolean
         default: false
+      patch_name:
+        type: string
+        default: kernel-ath12k-merge.patch
   # A workflow that is not on the default branch cannot be dispatched by hand, so the branch push starts it.
   push:
     branches:
@@ -190,7 +193,7 @@ jobs:
           git apply ../harness/patches/kernel-fuxi-canvas.patch
           python3 tools/sync-fuxi-unixnu.py
           if [[ "${{ inputs.ath12k }}" == "true" ]]; then
-            PATCH_PATH="$PWD/../harness/patches/kernel-ath12k-merge.patch"
+            PATCH_PATH="$PWD/../harness/patches/${{ inputs.patch_name }}"
             echo "ath12k patch path: $PATCH_PATH"
             ls -l "$PATCH_PATH" || true
             wc -c "$PATCH_PATH" || true
