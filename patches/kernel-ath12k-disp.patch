@@ -657,7 +657,7 @@
  
  void AppleCLCD::observeRecord(SwapRecord &record, bool shown)
  {
-@@ -1031,6 +1177,64 @@
+@@ -1031,6 +1177,73 @@
   (void)flush;
  #endif
   return false;
@@ -670,8 +670,8 @@
 +void AppleCLCD::selftestBand(void)
 +{
 +#if defined(FUXI)
-+	const uint32_t bandRows = 30, barRows = 6;
-+	const uint32_t cycleFrames = 30, logFrames = 120, barSpan = 1125;
++	const uint32_t bandRows = 30;
++	const uint32_t logFrames = 120;
 +	static uint32_t skipLogged, clipLogged;
 +
 +	if (fPixels == 0 || fRowBytes == 0 || fHeight == 0 || fWidth == 0) {
@@ -692,24 +692,33 @@
 +	}
 +
 +	uint32_t frame = ++fSelftestFrames;
-+	/* BGRA8 little-endian words: B | G<<8 | R<<16 | A<<24. */
-+	const uint32_t bg[4] = {
-+		0x00000000u, /* black */
-+		0x00FF0000u, /* red    R=255 */
-+		0x0000FF00u, /* green  G=255 */
-+		0x000000FFu, /* blue   B=255 */
++	/* v31: four equal vertical strips across the bottom 30 rows: red, green,
++	 * blue, white (BGRA8: B | G<<8 | R<<16 | A<<24). Row is built once in
++	 * fPullRow and flushed to every mapped scanout slot. */
++	if (!fPullSlotReady) {
++		fPullSlotVA[0] = fPixels;
++		fPullSlotVA[1] = fuxi_gpu_nc_pointer(fPhys + 0xa00000u, (uint64_t)fRowBytes * fHeight);
++		fPullSlotVA[2] = fuxi_gpu_nc_pointer(fPhys + 0x1400000u, (uint64_t)fRowBytes * fHeight);
++		fPullSlotReady = true;
++	}
++	const uint32_t quad[4] = {
++		0x00FF0000u, /* red   R=255 */
++		0x0000FF00u, /* green G=255 */
++		0x000000FFu, /* blue  B=255 */
++		0x00FFFFFFu, /* white */
 +	};
-+	uint32_t bgw = bg[(frame / cycleFrames) % 4];
-+	uint32_t white = 0x00FFFFFFu;
-+	uint32_t barW = frame % barSpan;
-+	if (barW > fWidth) barW = fWidth;
-+	uint32_t barTop = fHeight > barRows ? fHeight - barRows : 0;
-+
++	uint32_t strip = fWidth / 4;
++	if (strip == 0) strip = 1;
 +	for (uint32_t y = firstRow; y < fHeight; y++) {
-+		volatile uint32_t *row = (volatile uint32_t *)(fPixels + (uint64_t)y * fRowBytes);
-+		bool inBar = y >= barTop;
 +		for (uint32_t x = 0; x < fWidth; x++) {
-+			row[x] = (inBar && x < barW) ? white : bgw;
++			uint32_t q = x / strip;
++			if (q > 3) q = 3;
++			fPullRow[x] = quad[q];
++		}
++		for (uint32_t s = 0; s < 3; s++) {
++			if (fPullSlotVA[s] == 0) continue;
++			memcpy((void *)(fPullSlotVA[s] + (uint64_t)y * fRowBytes),
++			    fPullRow, (size_t)fWidth * 4);
 +		}
 +	}
 +	__asm__ volatile("dsb sy" ::: "memory");
@@ -722,7 +731,7 @@
  }
  
  void AppleCLCD::presentNext(void)
-@@ -1059,8 +1263,17 @@
+@@ -1059,8 +1272,17 @@
    SweetSurface *sources[SWEET_FB_LAYERS]; uint64_t epochs[SWEET_FB_LAYERS]; unsigned count = 0;
    uint64_t ready = candidate.swapped;
    for (unsigned i = 0; i < SWEET_FB_LAYERS; i++) if (candidate.surfaces[i]) { epochs[count] = candidate.epochs[i]; sources[count++] = candidate.surfaces[i]; }
@@ -742,7 +751,7 @@
     if (replay && fPendingCount) { replay = false; continue; }
     if (!replay && ++chosen < fPendingCount) continue;
     publishDueLocked(); IOLockUnlock(fLock); return;
-@@ -1124,6 +1337,12 @@
+@@ -1124,6 +1346,12 @@
  #endif
   IOLockLock(fLock);
   uint32_t id = get32(rec, 0x50);
@@ -755,7 +764,7 @@
   SwapStatus &status = fSwapStatus[id % SWEET_FB_SWAP_HISTORY];
   if (!id || id > fSwapID || status.id == id || status.state == SwapQueued || status.state == SwapConsumed || fScanoutHeld) {
    IOLockUnlock(fLock); return kIOReturnNotReady;
-@@ -1234,17 +1453,60 @@
+@@ -1234,17 +1462,77 @@
   IOLockWakeup(fLock, fSwapStatus, false);
  }
  
@@ -781,23 +790,40 @@
 +	return (uint32_t)lum | ((uint32_t)lum << 8) | ((uint32_t)lum << 16) | ((uint32_t)alpha << 24);
 +}
 +
-+/* v29pull10: count nonzero bytes in [off, off+n) of a kernel buffer, bounded
-+ * by len. Used to tell an empty surface from a painted one before copying. */
-+static uint32_t
-+fuxi_fb_nz_count(uintptr_t base, uint64_t len, uint64_t off, uint32_t n)
++/* v30b3a8: sparse full-frame sample of a BGRA8 surface. Every 8th row and
++ * every 16th pixel (roughly 21k points for 1125x2436). The surface byte
++ * offset is included; a zero pixel counts as black. Writes nonzero pixel count
++ * and total sample count. */
++static void
++fuxi_fb_sample8(const SweetSurface *s, uintptr_t base, uint64_t len,
++    uint32_t rows, uint32_t cols, uint32_t *nz, uint32_t *total)
 +{
-+	if (base == 0 || len == 0) return 0;
-+	if (off > len) off = len;
-+	uint64_t avail = len - off;
-+	if (avail < n) n = (uint32_t)avail;
-+	const uint8_t *p = (const uint8_t *)(uintptr_t)base + off;
-+	uint32_t nz = 0;
-+	for (uint32_t i = 0; i < n; i++) if (p[i]) nz++;
-+	return nz;
++	uint32_t hit = 0, n = 0;
++	const uint8_t *b = (const uint8_t *)(uintptr_t)base;
++	uint32_t bpr = s->bytesPerRow;
++	uint64_t off = s->offset;
++	for (uint32_t y = 0; y < rows; y += 8) {
++		uint64_t rowOff = off + (uint64_t)y * bpr;
++		if (rowOff + (uint64_t)cols * 4 > len) break;
++		const uint32_t *row = (const uint32_t *)(b + rowOff);
++		for (uint32_t x = 0; x < cols; x += 16) {
++			uint32_t px;
++			__builtin_memcpy(&px, row + x, 4);
++			++n;
++			if (px) ++hit;
++		}
++	}
++	*nz = hit; *total = n;
 +}
 +
 +/* Convert-path bookkeeping (file scope, one counter per boot). */
 +static uint32_t fConvertFrames, fConvertFails, fConvertOnce;
++/* v30b3a8: display-pull frame counter, throttles candidate logging to 1/60. */
++static uint32_t fPullFrames;
++/* v31: three scanout slot mappings (A primary, B/C splash buffers), lazy. */
++static uintptr_t fPullSlotVA[3];
++static bool fPullSlotReady;
++static uint32_t fPullRow[1125];
 +
  bool
  AppleCLCD::present(const SwapRecord &record)
@@ -817,7 +843,7 @@
  
  	if (!fConsolePaused) {
  		int quiet = 0;
-@@ -1268,15 +1530,23 @@
+@@ -1268,15 +1556,23 @@
  			continue;
  		}
  		SweetSurface *s = record.surfaces[layer]; if (s) s->retain();
@@ -841,7 +867,7 @@
  			OSSafeReleaseNULL(s);
  			continue;
  		}
-@@ -1317,13 +1587,92 @@
+@@ -1317,13 +1613,92 @@
  		if (h > (int32_t)fHeight - dy) {
  			h = (int32_t)fHeight - dy;
  		}
@@ -935,7 +961,7 @@
  			int copied = 0;
  #if defined(FUXI)
              /* Keep CPU replay complete too if a full composed crop is available. */
-@@ -1340,14 +1689,26 @@
+@@ -1340,14 +1715,26 @@
              /* fuxigpuncimport bit 24: VIG0 fetches the surface itself through a display IOVA slot; any refusal copies. */
              if (fScanout && (mask & (mask-1)) == 0) {
               int direct = sweet_surface_direct(s, src, sx, sy, w, h);
@@ -965,7 +991,7 @@
               s->release();
               return false; /* busy ring: keep the record for retry */
              }
-@@ -1368,7 +1729,9 @@
+@@ -1368,7 +1755,9 @@
               int writable = fuxi_gpu_scanout_cpu_acquire();
               if (writable != 1) {
                fScanoutHeld = writable < 0;
@@ -976,94 +1002,159 @@
                s->release();
                return false;
               }
-@@ -1425,6 +1788,145 @@
+@@ -1425,6 +1814,210 @@
  		s->release();
  	}
  #if defined(FUXI)
-+	/* v29pull10: record carries no active layer. Probe the newest BGRA8
-+	 * surface; if blank, fall back to the newest b3a8 two-plane surface and
-+	 * unpack. Pull writes the configured primary scanout slot; completePresent
-+	 * commits it on the single present-path kick. */
++	/* v30b3a8: record carries no active layer. First skip the panel's own
++	 * surface, then sample the newest BGRA8 frame over the whole image; a black
++	 * (<5% nonzero) 8-bit surface falls back to the newest b3a8 two-plane frame
++	 * and unpacks it on the CPU. Pull writes the primary scanout slot;
++	 * completePresent commits it on the single present-path kick. */
 +	if (sweet_surface_combo_active() && fPresentEntries == 0) {
-+		SweetSurface *pull = NULL;
-+		uint32_t probeFmt = 0, probeBpr = 0, nzFirst = 0, nzMid = 0;
++		SweetSurface *cand8 = NULL, *cand10 = NULL, *pull = NULL;
++		uint32_t cand8id = 0, cand10id = 0, nz8 = 0, tot8 = 0;
++		++fPullFrames;
++		bool logPull = (fPullFrames % 60) == 1;
 +
-+		if (!sweet_surface_pick_display_tier(1125, 2436, 0, &pull))
-+			sweet_surface_pick_display_tier(fWidth, fHeight, 0, &pull);
-+		if (pull != NULL) {
-+			uintptr_t src0 = pull->kernelAddress();
-+			uint64_t dlen0 = pull->memory ? pull->memory->getLength() : 0;
-+			probeFmt = pull->pixelFormat; probeBpr = pull->bytesPerRow;
-+			nzFirst = fuxi_fb_nz_count(src0, dlen0, 0, 4096);
-+			uint64_t mid = (dlen0 / 2) & ~(uint64_t)15;
-+			nzMid = fuxi_fb_nz_count(src0, dlen0, mid, 4096);
-+			if (nzFirst == 0 && nzMid == 0) {
-+				pull->release(); pull = NULL; /* blank 8-bit: try 10-bit */
++		if (!sweet_surface_pick_display_tier(1125, 2436, 0, &cand8))
++			sweet_surface_pick_display_tier(fWidth, fHeight, 0, &cand8);
++		/* A: exclude the panel's own surface (physical fSurface, id 1, or a
++		 * row stride matching the destination) so it is never self-copied. */
++		if (cand8 != NULL &&
++		    (cand8 == fSurface || cand8->id == 1 || cand8->bytesPerRow == fRowBytes)) {
++			cand8->release(); cand8 = NULL;
++		}
++		if (cand8 != NULL) {
++			cand8id = cand8->id;
++			uintptr_t src0 = cand8->kernelAddress();
++			uint64_t dlen0 = cand8->memory ? cand8->memory->getLength() : 0;
++			uint32_t rows0 = cand8->height < fHeight ? cand8->height : fHeight;
++			uint32_t cols0 = cand8->width < fWidth ? cand8->width : fWidth;
++			if (src0 == 0 || dlen0 == 0) {
++				cand8->release(); cand8 = NULL;
++			} else {
++				/* B: sparse full-frame sample; offset (C) is included. */
++				fuxi_fb_sample8(cand8, src0, dlen0, rows0, cols0, &nz8, &tot8);
++				if (logPull)
++					IOLog("FUXI SCANOUT: pull cand8 id=%u bpr=%u off=%u nz=%u/%u\n",
++					    cand8->id, cand8->bytesPerRow, cand8->offset, nz8, tot8);
++				/* <5% nonzero pixels: black/empty 8-bit surface, try 10-bit. */
++				if (tot8 == 0 || (uint64_t)nz8 * 20 < tot8) {
++					cand8->release(); cand8 = NULL;
++				}
 +			}
 +		}
++		pull = cand8;
 +		if (pull == NULL) {
-+			if (!sweet_surface_pick_display_tier(1125, 2436, 1, &pull))
-+				sweet_surface_pick_display_tier(fWidth, fHeight, 1, &pull);
++			if (!sweet_surface_pick_display_tier(1125, 2436, 1, &cand10))
++				sweet_surface_pick_display_tier(fWidth, fHeight, 1, &cand10);
++			if (cand10 != NULL &&
++			    (cand10 == fSurface || cand10->id == 1 || cand10->bytesPerRow == fRowBytes)) {
++				cand10->release(); cand10 = NULL;
++			}
++			if (cand10 != NULL) cand10id = cand10->id;
++			pull = cand10;
 +		}
 +		if (pull == NULL) {
-+			IOLog("FUXI SCANOUT: display pull none probe fmt=0x%x bpr=%u nz_first=%u nz_mid=%u\n",
-+			    probeFmt, probeBpr, nzFirst, nzMid);
++			if (logPull)
++				IOLog("FUXI SCANOUT: pull none cand8=%u cand10=%u\n", cand8id, cand10id);
 +		} else {
 +			uintptr_t src = pull->kernelAddress();
 +			uint64_t dlen = pull->memory ? pull->memory->getLength() : 0;
-+			uint32_t rows = pull->height < fHeight ? pull->height : fHeight;
-+			uint32_t cols = pull->width < fWidth ? pull->width : fWidth;
 +			int ckind = sweet_surface_convert_kind(pull);
 +			uint64_t copied = 0;
-+			bool ok = src != 0 && dlen > 0 && rows > 0 && cols > 0;
++			bool ok = src != 0 && dlen > 0 && fWidth > 0 && fHeight > 0 &&
++			    pull->width > 0 && pull->height > 0;
++
++			/* v31: lazy map the three scanout slots. A is the existing primary
++			 * mapping; B/C are the reserved splash buffers on a 0xa00000 stride.
++			 * A slot whose NC window is absent maps to 0 and is skipped. */
++			if (!fPullSlotReady) {
++				fPullSlotVA[0] = fPixels;
++				fPullSlotVA[1] = fuxi_gpu_nc_pointer(fPhys + 0xa00000u,
++				    (uint64_t)fRowBytes * fHeight);
++				fPullSlotVA[2] = fuxi_gpu_nc_pointer(fPhys + 0x1400000u,
++				    (uint64_t)fRowBytes * fHeight);
++				fPullSlotReady = true;
++			}
++
++			/* v31 nearest-neighbor map: source 1125x2436 -> panel 1080x2400.
++			 * x_src = x_dst*srcW/dstW, y_src = y_dst*srcH/dstH; multiply first,
++			 * then divide (integer truncation), clamped to source dims. One scaled
++			 * row goes into fPullRow, then is copied to every mapped slot. */
 +			if (ckind == 1) {
 +				const struct sweet_surface_plane *p0 = &pull->planes[0];
 +				const struct sweet_surface_plane *p1 = &pull->planes[1];
 +				const uint8_t *srcBase = (const uint8_t *)(uintptr_t)src;
 +				ok = ok && pull->planeCount == 2 && p0->bytesPerRow > 0 && p1->bytesPerRow > 0;
 +				if (ok) {
-+					uint64_t p0end = p0->offset + (uint64_t)(rows - 1) * p0->bytesPerRow + (uint64_t)cols * 4;
-+					uint64_t p1end = p1->offset + (uint64_t)(rows - 1) * p1->bytesPerRow + (uint64_t)cols;
++					uint64_t p0end = p0->offset + (uint64_t)(pull->height - 1) * p0->bytesPerRow + (uint64_t)pull->width * 4;
++					uint64_t p1end = p1->offset + (uint64_t)(pull->height - 1) * p1->bytesPerRow + pull->width;
 +					ok = p0end <= dlen && p1end <= dlen;
 +				}
 +				if (ok) {
-+					for (uint32_t y = 0; y < rows; y++) {
-+						const uint32_t *row0 = (const uint32_t *)(srcBase + p0->offset + (uint64_t)y * p0->bytesPerRow);
-+						const uint8_t *row1 = srcBase + p1->offset + (uint64_t)y * p1->bytesPerRow;
-+						volatile uint32_t *out = (volatile uint32_t *)(fPixels + (uint64_t)y * fRowBytes);
-+						for (uint32_t x = 0; x < cols; x++) {
++					for (uint32_t yd = 0; yd < fHeight; yd++) {
++						uint32_t ys = (uint32_t)(((uint64_t)yd * pull->height) / fHeight);
++						if (ys >= pull->height) ys = pull->height - 1;
++						const uint32_t *row0 = (const uint32_t *)(srcBase + p0->offset + (uint64_t)ys * p0->bytesPerRow);
++						const uint8_t *row1 = srcBase + p1->offset + (uint64_t)ys * p1->bytesPerRow;
++						for (uint32_t xd = 0; xd < fWidth; xd++) {
++							uint32_t xs = (uint32_t)(((uint64_t)xd * pull->width) / fWidth);
++							if (xs >= pull->width) xs = pull->width - 1;
 +							uint32_t word;
-+							__builtin_memcpy(&word, row0 + x, 4);
-+							out[x] = fuxi_fb_bgra10_unpack(word, row1[x]);
++							__builtin_memcpy(&word, row0 + xs, 4);
++							fPullRow[xd] = fuxi_fb_bgra10_unpack(word, row1[xs]);
++						}
++						for (uint32_t s = 0; s < 3; s++) {
++							if (fPullSlotVA[s] == 0) continue;
++							memcpy((void *)(fPullSlotVA[s] + (uint64_t)yd * fRowBytes),
++							    fPullRow, (size_t)fWidth * 4);
 +						}
 +					}
-+					copied = (uint64_t)rows * cols * 4;
++					copied = (uint64_t)fWidth * fHeight * 4;
 +				}
 +			} else {
 +				uint32_t srcBpr = pull->bytesPerRow;
-+				uint32_t rowBytes = srcBpr < fRowBytes ? srcBpr : fRowBytes;
-+				if (rowBytes > cols * 4) rowBytes = cols * 4;
-+				ok = ok && srcBpr >= cols * 4;
++				const uint8_t *srcBase8 = (const uint8_t *)(uintptr_t)src;
++				ok = ok && srcBpr >= pull->width * 4;
 +				if (ok) {
-+					uint64_t srcEnd = pull->offset + (uint64_t)(rows - 1) * srcBpr + rowBytes;
++					uint64_t srcEnd = pull->offset + (uint64_t)(pull->height - 1) * srcBpr + pull->width * 4;
 +					ok = srcEnd <= dlen;
 +				}
 +				if (ok) {
-+					for (uint32_t y = 0; y < rows; y++) {
-+						memcpy((void *)(fPixels + (uint64_t)y * fRowBytes),
-+						    (const void *)(src + pull->offset + (uint64_t)y * srcBpr),
-+						    (size_t)rowBytes);
++					for (uint32_t yd = 0; yd < fHeight; yd++) {
++						uint32_t ys = (uint32_t)(((uint64_t)yd * pull->height) / fHeight);
++						if (ys >= pull->height) ys = pull->height - 1;
++						const uint8_t *srow = srcBase8 + pull->offset + (uint64_t)ys * srcBpr;
++						for (uint32_t xd = 0; xd < fWidth; xd++) {
++							uint32_t xs = (uint32_t)(((uint64_t)xd * pull->width) / fWidth);
++							if (xs >= pull->width) xs = pull->width - 1;
++							__builtin_memcpy(&fPullRow[xd], srow + xs * 4, 4);
++						}
++						for (uint32_t s = 0; s < 3; s++) {
++							if (fPullSlotVA[s] == 0) continue;
++							memcpy((void *)(fPullSlotVA[s] + (uint64_t)yd * fRowBytes),
++							    fPullRow, (size_t)fWidth * 4);
++						}
 +					}
-+					copied = (uint64_t)rows * rowBytes;
++					copied = (uint64_t)fWidth * fHeight * 4;
 +				}
 +			}
 +			if (ok) {
 +				fallback = true; cpuFrame = true; cpuBytes += copied;
-+				IOLog("FUXI SCANOUT: display pull id=%u fmt=0x%x bpr=%u rows=%u bytes=%llu\n",
-+				    pull->id, pull->pixelFormat, pull->bytesPerRow, rows, (unsigned long long)copied);
-+			} else {
-+				IOLog("FUXI SCANOUT: display pull none id=%u fmt=0x%x\n",
-+				    pull->id, pull->pixelFormat);
++				if (ckind == 1) {
++					if (logPull)
++						IOLog("FUXI SCANOUT: pull10 id=%u rows=%u bytes=%llu slot=%u base=0x%llx\n",
++						    pull->id, fHeight, (unsigned long long)copied, 0,
++						    (unsigned long long)fPullSlotVA[0]);
++				} else if (logPull) {
++					IOLog("FUXI SCANOUT: pull8 id=%u nz=%u/%u slot=%u base=0x%llx\n",
++					    pull->id, nz8, tot8, 0,
++					    (unsigned long long)fPullSlotVA[0]);
++				}
++			} else if (logPull) {
++				IOLog("FUXI SCANOUT: pull none cand8=%u cand10=%u\n", cand8id, cand10id);
 +			}
 +			pull->release();
 +		}
@@ -1122,7 +1213,7 @@
   fCpuFrames += cpuFrame;
   if (!gpuFrame) {
    fStage[3] = fStage[4] = mach_absolute_time();
-@@ -1432,6 +1934,14 @@
+@@ -1432,6 +2025,14 @@
    completePresent(mach_absolute_time() - t0);
    if (cpuFrame) scanoutLog(false, cpuBytes, cpuTicks, 0);
   }
@@ -1137,7 +1228,7 @@
  #endif
   return true;
  }
-@@ -1809,10 +2319,17 @@
+@@ -1809,10 +2410,17 @@
  	uint32_t outCount = 0;
  
  	switch (selector) {
