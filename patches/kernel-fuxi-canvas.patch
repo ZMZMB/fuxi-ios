@@ -1,44 +1,7 @@
---- a/xnu/fuxi-unixnu/SweetFramebuffer.cpp
-+++ b/xnu/fuxi-unixnu/SweetFramebuffer.cpp
-@@ -107,7 +107,7 @@
- #define SWEET_FB_NOTIFY_TYPES           8
- #define SWEET_FB_NOTIFY_VSYNC           5
- #define SWEET_FB_VSYNC_US               16667
--#define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
-+#define SWEET_FB_DOT_PITCH              476     /* ppi, iPhone 12 mini 1080x2340 */
- /*
-  * The iOS userland only has status bar / layout data for real iPhone
-  * screens (UIKit: "No status bar visual provider for screen", the red
-@@ -116,8 +116,8 @@
-  * centered 1080x2400 part of it is shown on the 1080x2400 panel.
-  * Boot-arg sweetfb_native=1 presents the real panel size instead.
-  */
--#define SWEET_FB_LOGICAL_W              1125
--#define SWEET_FB_LOGICAL_H              2436
-+#define SWEET_FB_LOGICAL_W              1080
-+#define SWEET_FB_LOGICAL_H              2340
- #define SWEET_FB_FORMAT_BGRA            0x42475241
- 
- class IOMobileFramebuffer : public IOService {
-@@ -555,7 +555,7 @@
- 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
- 	fLogicalW = fWidth;
- 	fLogicalH = fHeight;
--	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
-+	if (!native) {
- 		fLogicalW = SWEET_FB_LOGICAL_W;
- 		fLogicalH = SWEET_FB_LOGICAL_H;
- 	}
---- a/xnu/fuxi-h1/SweetHID.cpp
-+++ b/xnu/fuxi-h1/SweetHID.cpp
-@@ -458,8 +458,8 @@
- 	}
- 	int native = 0;
- 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
--	fLogicalW = native ? 1080 : 1125;
--	fLogicalH = native ? 2400 : 2436;
-+	fLogicalW = 1080; (void)native;
-+	fLogicalH = 2340;
- 	fOffX = (fLogicalW - 1080) / 2;
- 	fOffY = (fLogicalH - 2400) / 2;
- 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+diff --git a/tools/ci/canvas-geometry-noop.txt b/tools/ci/canvas-geometry-noop.txt
+new file mode 100644
+index 0000000..e69de29
+--- /dev/null
++++ b/tools/ci/canvas-geometry-noop.txt
+@@ -0,0 +1 @@
++canvas geometry patch retired: LOGICAL 1125x2436, DOT_PITCH 458, native guard restored
