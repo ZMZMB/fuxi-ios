@@ -399,7 +399,7 @@
  #endif /* _SWEET_SURFACE_H */
 --- a/xnu/fuxi-unixnu/SweetFramebuffer.cpp
 +++ b/xnu/fuxi-unixnu/SweetFramebuffer.cpp
-@@ -68,10 +68,17 @@
+@@ -68,10 +68,18 @@
  #include <IOKit/IOWorkLoop.h>
  #include <IOKit/IOTimerEventSource.h>
  #include <IOKit/system.h>
@@ -407,6 +407,7 @@
  #include <pexpert/pexpert.h>
  #include <kern/clock.h>
  #include <kern/thread_call.h>
++#include <mach/vm_param.h>
  #include <sys/proc.h>
 +
 +/* Present bookkeeping (file scope, one counter per boot; used before its old
@@ -417,7 +418,7 @@
  
  #if defined(FUXI)
  extern bool sweet_surface_present_begin(SweetSurface **surfaces, unsigned count, uint64_t *ready, const uint64_t *epochs);
-@@ -81,6 +88,61 @@
+@@ -81,6 +89,61 @@
  extern void sweet_surface_display_wait_stats(uint32_t *waits, uint32_t *timeouts, uint64_t *sum, uint64_t *max);
  extern void fuxi_backlight_publish(IOService *provider);
  extern void fuxi_backlight_display_state(IOService *provider, bool on);
@@ -479,7 +480,31 @@
  #endif
  
  enum {
-@@ -638,6 +700,7 @@
+@@ -199,6 +262,7 @@
+ 	uint32_t      fPresentTrace, fPresentTraceN;
+ 	uint64_t      fPresentTraceLast;
+ 	uint32_t      fGpuFrames, fCpuFrames;
++	uint32_t      fSelftestFrames;  /* v27diag panel self-test band frame counter */
+ 	uint64_t      fGpuTime, fCpuTime;
+ 	bool          fUnixnuDiff, fUnixnuIdle, fTickArmed;
+ 	bool          fShadowValid;
+@@ -309,6 +373,7 @@
+  unsigned      fWakeN[2];
+  bool          fStageGpu;
+  bool presentStep(bool flush);
++ void selftestBand(void);
+  void stageStats(uint64_t now);
+ 	uint32_t      fGpuBusyTicks, fGpuFailed;
+ 
+@@ -626,6 +691,7 @@
+ 	PE_parse_boot_argn("fuxipresent", &fPresentTrace, sizeof(fPresentTrace));
+ 	fPresentTraceN = 0;
+ 	fPresentTraceLast = 0;
++	fSelftestFrames = 0;
+ #else
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ #endif
+@@ -638,6 +704,7 @@
  	PE_parse_boot_argn("fuxibacklight", &backlight, sizeof(backlight));
  	fBacklightPowerNotifications = backlight == 2 || backlight == 3;
  	fuxi_backlight_publish(this);
@@ -487,7 +512,7 @@
  	sweet_fb_refresh_publish(this);
   fSwapHist = sweet_fb_adt_u32(provider, "fuxi,swap-hist") == 1;
   nanoseconds_to_absolutetime(100000000ULL, &fSwapIdle);
-@@ -658,7 +721,11 @@
+@@ -658,7 +725,11 @@
   fScanoutLog = log == 1 ? 2 : fScanout ? 1 : 0;
   if (scanout == 1 && !fScanout)
    IOLog("FUXI SCANOUT: unavailable, requires sweetfb_noconsole=1 or 2; existing present path\n");
@@ -500,7 +525,17 @@
   fuxi_gpu_scanout_configure(fPixels, fScanout, check);
   uint32_t nc = 0;
   PE_parse_boot_argn("fuxigpuncimport", &nc, sizeof(nc));
-@@ -892,8 +959,80 @@
+@@ -814,6 +885,9 @@
+  fb->fStageCallbacks[vsyncTick ? 0 : 1]++;
+  bool flush = (count % fb->fFlushTicks) == 0 && (vsyncTick || fb->fFlushTicks == 1);
+  if (!fb->presentStep(flush)) { sweet_fb_rearm(fb, sender); return; }
++ /* Fallback blit runs inside presentStep->present; the self-test band paints
++  * only after it, so the bottom strip never fights the fallback full-frame. */
++ fb->selftestBand();
+ #endif
+  IOLockLock(fb->fLock);
+ 	if (fb->fPowerOff) {
+@@ -892,8 +966,80 @@
  	return v;
  }
  
@@ -581,7 +616,74 @@
  
  void AppleCLCD::observeRecord(SwapRecord &record, bool shown)
  {
-@@ -1059,8 +1198,17 @@
+@@ -1031,6 +1177,66 @@
+  (void)flush;
+ #endif
+  return false;
++}
++
++/* v27diag panel self-test band: does not depend on layers, scaler or the
++ * fallback blit. Draws only the bottom 200 rows so the console text on the
++ * upper half stays visible; background cycles black/red/green/blue every 30
++ * frames, a white bar grows across the bottom 20 rows one pixel per frame. */
++void AppleCLCD::selftestBand(void)
++{
++#if defined(FUXI)
++	const uint32_t bandRows = 200, barRows = 20;
++	const uint32_t cycleFrames = 30, logFrames = 120, barSpan = 1125;
++	static uint32_t skipLogged, clipLogged;
++
++	if (fPixels == 0 || fRowBytes == 0 || fHeight == 0 || fWidth == 0) {
++		if (skipLogged == 0) { skipLogged = 1; IOLog("FUXI SCANOUT: selftest skip reason=pointer-or-size\n"); }
++		return;
++	}
++	uint64_t panelSize = (uint64_t)fRowBytes * fHeight;
++	uint32_t firstRow = fHeight > bandRows ? fHeight - bandRows : 0;
++	uint32_t rows = fHeight - firstRow;
++	uint64_t lastEnd = (uint64_t)(firstRow + rows - 1) * fRowBytes + (uint64_t)fWidth * 4;
++	if (lastEnd > panelSize) {
++		if (skipLogged == 0) { skipLogged = 1; IOLog("FUXI SCANOUT: selftest skip reason=overflow\n"); }
++		return;
++	}
++	if (rows < bandRows && clipLogged == 0) {
++		clipLogged = 1;
++		IOLog("FUXI SCANOUT: selftest clipped rows=%u\n", bandRows - rows);
++	}
++
++	uint32_t frame = ++fSelftestFrames;
++	/* BGRA8 little-endian words: B | G<<8 | R<<16 | A<<24. */
++	const uint32_t bg[4] = {
++		0x00000000u, /* black */
++		0x00FF0000u, /* red    R=255 */
++		0x0000FF00u, /* green  G=255 */
++		0x000000FFu, /* blue   B=255 */
++	};
++	uint32_t bgw = bg[(frame / cycleFrames) % 4];
++	uint32_t white = 0x00FFFFFFu;
++	uint32_t barW = frame % barSpan;
++	if (barW > fWidth) barW = fWidth;
++	uint32_t barTop = fHeight > barRows ? fHeight - barRows : 0;
++
++	for (uint32_t y = firstRow; y < fHeight; y++) {
++		volatile uint32_t *row = (volatile uint32_t *)(fPixels + (uint64_t)y * fRowBytes);
++		bool inBar = y >= barTop;
++		for (uint32_t x = 0; x < fWidth; x++) {
++			row[x] = (inBar && x < barW) ? white : bgw;
++		}
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	/* Existing commit path: offer the panel to the scanout owner, then fire the
++	 * DSI START kick already used by the fade-out path. No new commit route. */
++	if (fScanout && fuxi_gpu_scanout_publish() == 0) fuxi_display_kick();
++	else if (!fScanout) fuxi_display_kick();
++
++	if ((frame % logFrames) == 0)
++		IOLog("FUXI SCANOUT: selftest frames=%u\n", frame);
++#endif
+ }
+ 
+ void AppleCLCD::presentNext(void)
+@@ -1059,8 +1265,17 @@
    SweetSurface *sources[SWEET_FB_LAYERS]; uint64_t epochs[SWEET_FB_LAYERS]; unsigned count = 0;
    uint64_t ready = candidate.swapped;
    for (unsigned i = 0; i < SWEET_FB_LAYERS; i++) if (candidate.surfaces[i]) { epochs[count] = candidate.epochs[i]; sources[count++] = candidate.surfaces[i]; }
@@ -601,7 +703,7 @@
     if (replay && fPendingCount) { replay = false; continue; }
     if (!replay && ++chosen < fPendingCount) continue;
     publishDueLocked(); IOLockUnlock(fLock); return;
-@@ -1124,6 +1272,12 @@
+@@ -1124,6 +1339,12 @@
  #endif
   IOLockLock(fLock);
   uint32_t id = get32(rec, 0x50);
@@ -614,7 +716,7 @@
   SwapStatus &status = fSwapStatus[id % SWEET_FB_SWAP_HISTORY];
   if (!id || id > fSwapID || status.id == id || status.state == SwapQueued || status.state == SwapConsumed || fScanoutHeld) {
    IOLockUnlock(fLock); return kIOReturnNotReady;
-@@ -1234,13 +1388,38 @@
+@@ -1234,13 +1455,38 @@
   IOLockWakeup(fLock, fSwapStatus, false);
  }
  
@@ -654,7 +756,7 @@
  #if defined(FUXI)
   struct PresentRead { bool held; ~PresentRead() { if (held) sweet_surface_present_end(); } } read = { fScanout };
  #endif
-@@ -1268,15 +1447,23 @@
+@@ -1268,15 +1514,23 @@
  			continue;
  		}
  		SweetSurface *s = record.surfaces[layer]; if (s) s->retain();
@@ -678,7 +780,7 @@
  			OSSafeReleaseNULL(s);
  			continue;
  		}
-@@ -1317,13 +1504,92 @@
+@@ -1317,13 +1571,92 @@
  		if (h > (int32_t)fHeight - dy) {
  			h = (int32_t)fHeight - dy;
  		}
@@ -772,7 +874,7 @@
  			int copied = 0;
  #if defined(FUXI)
              /* Keep CPU replay complete too if a full composed crop is available. */
-@@ -1340,14 +1606,26 @@
+@@ -1340,14 +1673,26 @@
              /* fuxigpuncimport bit 24: VIG0 fetches the surface itself through a display IOVA slot; any refusal copies. */
              if (fScanout && (mask & (mask-1)) == 0) {
               int direct = sweet_surface_direct(s, src, sx, sy, w, h);
@@ -802,7 +904,7 @@
               s->release();
               return false; /* busy ring: keep the record for retry */
              }
-@@ -1368,7 +1646,9 @@
+@@ -1368,7 +1713,9 @@
               int writable = fuxi_gpu_scanout_cpu_acquire();
               if (writable != 1) {
                fScanoutHeld = writable < 0;
@@ -813,7 +915,7 @@
                s->release();
                return false;
               }
-@@ -1425,6 +1705,52 @@
+@@ -1425,6 +1772,57 @@
  		s->release();
  	}
  #if defined(FUXI)
@@ -830,16 +932,21 @@
 +			sweet_fb_fallback fb;
 +			if (sweet_surface_fallback_pick(&fb)) {
 +				uint64_t panelSize = (uint64_t)fRowBytes * fHeight;
-+				uint8_t probe[4] = {};
-+				bool readable = fb.addr != 0 && fb.size > 0 &&
++				bool notKernel = (uintptr_t)fb.addr < (uintptr_t)VM_MIN_KERNEL_ADDRESS;
++				bool valid = !notKernel && fb.addr != 0 && fb.size > 0 &&
 +				    panelSize >= fb.size &&
-+				    copyin((user_addr_t)fb.addr, probe, sizeof(probe)) == 0;
-+				if (!readable) {
++				    fb.bpr >= (uint32_t)fb.w * 4 &&
++				    (uint64_t)fb.bpr * fb.h <= fb.size;
++				if (!valid) {
 +					uint64_t nowf = mach_absolute_time(), ns = 0;
 +					absolutetime_to_nanoseconds(nowf - gFallbackLastLog, &ns);
 +					if (gFallbackLastLog == 0 || ns >= 1000000000ULL) {
 +						gFallbackLastLog = nowf;
-+						IOLog("FUXI SCANOUT: fallback blit id=%u src unreadable\n", fb.id);
++						if (notKernel)
++							IOLog("FUXI SCANOUT: fallback blit id=%u addr=0x%llx not kernel\n",
++							    fb.id, (unsigned long long)fb.addr);
++						else
++							IOLog("FUXI SCANOUT: fallback blit id=%u src invalid\n", fb.id);
 +					}
 +				} else {
 +					uint32_t rows = fb.h < fHeight ? fb.h : fHeight;
@@ -856,8 +963,8 @@
 +					absolutetime_to_nanoseconds(nowf - gFallbackLastLog, &ns);
 +					if (gFallbackLastLog == 0 || ns >= 1000000000ULL) {
 +						gFallbackLastLog = nowf;
-+						IOLog("FUXI SCANOUT: fallback blit id=%u bpr=%u bytes=%llu\n",
-+						    fb.id, fb.bpr, (unsigned long long)fb.size);
++						IOLog("FUXI SCANOUT: fallback blit id=%u bpr=%u bytes=%llu rows=%u cols=%u\n",
++						    fb.id, fb.bpr, (unsigned long long)fb.size, rows, cols);
 +					}
 +				}
 +			}
@@ -866,7 +973,7 @@
   fCpuFrames += cpuFrame;
   if (!gpuFrame) {
    fStage[3] = fStage[4] = mach_absolute_time();
-@@ -1432,6 +1758,14 @@
+@@ -1432,6 +1830,14 @@
    completePresent(mach_absolute_time() - t0);
    if (cpuFrame) scanoutLog(false, cpuBytes, cpuTicks, 0);
   }
@@ -881,7 +988,7 @@
  #endif
   return true;
  }
-@@ -1809,10 +2143,17 @@
+@@ -1809,10 +2215,17 @@
  	uint32_t outCount = 0;
  
  	switch (selector) {
