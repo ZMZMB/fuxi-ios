@@ -1,6 +1,7 @@
---- a/README.md
-+++ b/README.md
-@@ -94,1 +94,3 @@
-iOS itself is Apple's and is not distributed here.
-
-<!-- fuxi v13wifi-1 build marker: display frozen at ci/source, ath12k link enabled -->
+diff --git a/tools/ci/v13wifi-1-marker.txt b/tools/ci/v13wifi-1-marker.txt
+new file mode 100644
+index 0000000..e69de29
+--- /dev/null
++++ b/tools/ci/v13wifi-1-marker.txt
+@@ -0,0 +1 @@
++v13wifi-1: display frozen at ci/source (85678 B, 2026-11-26 11:12:22), ath12k link enabled
