@@ -295,20 +295,95 @@
  #endif /* _SWEET_SURFACE_H */
 --- a/xnu/fuxi-unixnu/SweetFramebuffer.cpp
 +++ b/xnu/fuxi-unixnu/SweetFramebuffer.cpp
-@@ -73,6 +73,12 @@
+@@ -68,10 +68,17 @@
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/IOTimerEventSource.h>
+ #include <IOKit/system.h>
++#include <libkern/c++/OSBoolean.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
  #include <kern/thread_call.h>
  #include <sys/proc.h>
- 
++
 +/* Present bookkeeping (file scope, one counter per boot; used before its old
 + * definition site, so it is declared here). */
 +static uint32_t fPresentEntries, fPresentDrops;
 +static uint32_t fMaskZeroDumps;
 +static uint32_t fRecordDumpCount;
-+
+ 
  #if defined(FUXI)
  extern bool sweet_surface_present_begin(SweetSurface **surfaces, unsigned count, uint64_t *ready, const uint64_t *epochs);
- extern void sweet_surface_present_end(void);
-@@ -658,7 +664,11 @@
+@@ -81,6 +88,61 @@
+ extern void sweet_surface_display_wait_stats(uint32_t *waits, uint32_t *timeouts, uint64_t *sum, uint64_t *max);
+ extern void fuxi_backlight_publish(IOService *provider);
+ extern void fuxi_backlight_display_state(IOService *provider, bool on);
++extern void fuxi_scaler_stub_publish(IOService *provider);
++#endif
++
++#if defined(FUXI)
++/* v25diag: discovery-only stub for the CSC/scaler service backboardd looks up
++ * by IOProviderClass "AppleM2ScalerCSCDriver". It implements no scaler/CSC ABI;
++ * it only makes the name matchable early so the match loop can proceed past it. */
++class AppleM2ScalerCSCDriver : public IOService {
++	OSDeclareDefaultStructors(AppleM2ScalerCSCDriver);
++	static uint32_t fMatchLog;
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn newUserClient(task_t task, void *securityID, UInt32 type,
++	    OSDictionary *properties, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(AppleM2ScalerCSCDriver, IOService);
++uint32_t AppleM2ScalerCSCDriver::fMatchLog = 0;
++
++bool AppleM2ScalerCSCDriver::start(IOService *provider)
++{
++	if (!IOService::start(provider)) return false;
++	setProperty("IOProviderClass", "AppleM2ScalerCSCDriver");
++	setProperty("IOClass", "AppleM2ScalerCSCDriver");
++	setProperty("HasScaler", kOSBooleanTrue);
++	setProperty("HasCSC", kOSBooleanTrue);
++	setProperty("Version", (uint64_t)1, 32);
++	return true;
++}
++
++IOReturn AppleM2ScalerCSCDriver::newUserClient(task_t task, void *securityID,
++    UInt32 type, OSDictionary *properties, IOUserClient **handler)
++{
++	(void)task; (void)securityID; (void)type; (void)properties;
++	if (handler) *handler = NULL;
++	if (fMatchLog < 8) {
++		char name[33] = {};
++		proc_selfname(name, sizeof(name));
++		IOLog("FUXI SCALER: matched, client=%.32s ret=0x0\n", name);
++		++fMatchLog;
++	}
++	return kIOReturnSuccess;
++}
++
++void fuxi_scaler_stub_publish(IOService *provider)
++{
++	AppleM2ScalerCSCDriver *service = new AppleM2ScalerCSCDriver;
++	if (!service) return;
++	if (!service->init() || !service->attach(provider) || !service->start(provider)) {
++		service->release();
++		return;
++	}
++	service->setName("AppleM2ScalerCSCDriver");
++	service->registerService();
++	service->release(); /* registry retains the published service for boot life */
++}
+ #endif
+ 
+ enum {
+@@ -638,6 +700,7 @@
+ 	PE_parse_boot_argn("fuxibacklight", &backlight, sizeof(backlight));
+ 	fBacklightPowerNotifications = backlight == 2 || backlight == 3;
+ 	fuxi_backlight_publish(this);
++	fuxi_scaler_stub_publish(this);
+ 	sweet_fb_refresh_publish(this);
+  fSwapHist = sweet_fb_adt_u32(provider, "fuxi,swap-hist") == 1;
+  nanoseconds_to_absolutetime(100000000ULL, &fSwapIdle);
+@@ -658,7 +721,11 @@
   fScanoutLog = log == 1 ? 2 : fScanout ? 1 : 0;
   if (scanout == 1 && !fScanout)
    IOLog("FUXI SCANOUT: unavailable, requires sweetfb_noconsole=1 or 2; existing present path\n");
@@ -321,7 +396,7 @@
   fuxi_gpu_scanout_configure(fPixels, fScanout, check);
   uint32_t nc = 0;
   PE_parse_boot_argn("fuxigpuncimport", &nc, sizeof(nc));
-@@ -892,6 +902,76 @@
+@@ -892,6 +959,76 @@
  	return v;
  }
  
@@ -398,7 +473,7 @@
  static uint32_t sweet_fb_swaps_logged;
  static uint64_t sweet_fb_swap_count;
  
-@@ -1059,8 +1139,17 @@
+@@ -1059,8 +1196,17 @@
    SweetSurface *sources[SWEET_FB_LAYERS]; uint64_t epochs[SWEET_FB_LAYERS]; unsigned count = 0;
    uint64_t ready = candidate.swapped;
    for (unsigned i = 0; i < SWEET_FB_LAYERS; i++) if (candidate.surfaces[i]) { epochs[count] = candidate.epochs[i]; sources[count++] = candidate.surfaces[i]; }
@@ -418,7 +493,7 @@
     if (replay && fPendingCount) { replay = false; continue; }
     if (!replay && ++chosen < fPendingCount) continue;
     publishDueLocked(); IOLockUnlock(fLock); return;
-@@ -1124,6 +1213,12 @@
+@@ -1124,6 +1270,12 @@
  #endif
   IOLockLock(fLock);
   uint32_t id = get32(rec, 0x50);
@@ -431,7 +506,7 @@
   SwapStatus &status = fSwapStatus[id % SWEET_FB_SWAP_HISTORY];
   if (!id || id > fSwapID || status.id == id || status.state == SwapQueued || status.state == SwapConsumed || fScanoutHeld) {
    IOLockUnlock(fLock); return kIOReturnNotReady;
-@@ -1234,6 +1329,31 @@
+@@ -1234,6 +1386,31 @@
   IOLockWakeup(fLock, fSwapStatus, false);
  }
  
@@ -463,7 +538,7 @@
  bool
  AppleCLCD::present(const SwapRecord &record)
  {
-@@ -1268,15 +1388,23 @@
+@@ -1268,15 +1445,23 @@
  			continue;
  		}
  		SweetSurface *s = record.surfaces[layer]; if (s) s->retain();
@@ -487,7 +562,7 @@
  			OSSafeReleaseNULL(s);
  			continue;
  		}
-@@ -1317,13 +1445,92 @@
+@@ -1317,13 +1502,92 @@
  		if (h > (int32_t)fHeight - dy) {
  			h = (int32_t)fHeight - dy;
  		}
@@ -581,7 +656,7 @@
  			int copied = 0;
  #if defined(FUXI)
              /* Keep CPU replay complete too if a full composed crop is available. */
-@@ -1340,14 +1547,26 @@
+@@ -1340,14 +1604,26 @@
              /* fuxigpuncimport bit 24: VIG0 fetches the surface itself through a display IOVA slot; any refusal copies. */
              if (fScanout && (mask & (mask-1)) == 0) {
               int direct = sweet_surface_direct(s, src, sx, sy, w, h);
@@ -611,7 +686,7 @@
               s->release();
               return false; /* busy ring: keep the record for retry */
              }
-@@ -1368,7 +1587,9 @@
+@@ -1368,7 +1644,9 @@
               int writable = fuxi_gpu_scanout_cpu_acquire();
               if (writable != 1) {
                fScanoutHeld = writable < 0;
@@ -622,7 +697,7 @@
                s->release();
                return false;
               }
-@@ -1432,6 +1653,14 @@
+@@ -1432,6 +1710,14 @@
    completePresent(mach_absolute_time() - t0);
    if (cpuFrame) scanoutLog(false, cpuBytes, cpuTicks, 0);
   }
@@ -637,7 +712,7 @@
  #endif
   return true;
  }
-@@ -1809,10 +2038,17 @@
+@@ -1809,10 +2095,17 @@
  	uint32_t outCount = 0;
  
  	switch (selector) {
