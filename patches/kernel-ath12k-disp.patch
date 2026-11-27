@@ -1,6 +1,6 @@
 --- a/xnu/fuxi-scanout/SweetSurface.cpp
 +++ b/xnu/fuxi-scanout/SweetSurface.cpp
-@@ -87,6 +87,102 @@
+@@ -87,6 +87,111 @@
  extern "C" void sweet_prof_user_bt(const char *tag);
  static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
  #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
@@ -77,7 +77,7 @@
 +}
 +
 +bool
-+sweet_surface_pick_display(uint32_t w, uint32_t h, SweetSurface **out)
++sweet_surface_pick_display_tier(uint32_t w, uint32_t h, uint32_t tier, SweetSurface **out)
 +{
 +	if (out == NULL || w == 0 || h == 0) return false;
 +	SweetSurface *bestA = NULL, *bestB = NULL;
@@ -92,7 +92,10 @@
 +			if (bestB == NULL || s->id > bestB->id) bestB = s;
 +		}
 +	}
-+	SweetSurface *best = bestA != NULL ? bestA : bestB;
++	SweetSurface *best;
++	if (tier == 1) best = bestB;
++	else if (tier == 0) best = bestA;
++	else best = bestA != NULL ? bestA : bestB;
 +	if (best != NULL) best->retain();
 +	IOLockUnlock(sweet_surface_lock);
 +	if (best == NULL) { *out = NULL; return false; }
@@ -100,10 +103,16 @@
 +	*out = best;
 +	return true;
 +}
++
++bool
++sweet_surface_pick_display(uint32_t w, uint32_t h, SweetSurface **out)
++{
++	return sweet_surface_pick_display_tier(w, h, 2, out);
++}
  
  static void sweet_surface_use_publish(SweetSurface *s)
  {
-@@ -746,10 +842,16 @@
+@@ -746,10 +851,16 @@
  }
  
  mach_port_name_t
@@ -122,7 +131,7 @@
  	return name;
  }
  
-@@ -783,6 +885,52 @@
+@@ -783,6 +894,52 @@
  		enabled = v <= 2 ? (int)v : 2;
  	}
  	return enabled;
@@ -175,7 +184,7 @@
  }
  
  /* Geometry from the creation properties (IOSurface.h keys). */
-@@ -854,6 +1002,14 @@
+@@ -854,6 +1011,14 @@
  		s->planeCount = planes->getCount();
  	}
  
@@ -190,7 +199,7 @@
  	uint64_t alloc = sweet_dict_u32(props, "IOSurfaceAllocSize", 0);
  	if (alloc < end) {
  		alloc = end;
-@@ -949,6 +1105,7 @@
+@@ -949,6 +1114,7 @@
  	IOReturn trapLock(void *id, void *options, void *seedOut, void *, void *, void *);
  	IOReturn trapUnlock(void *id, void *options, void *seedOut, void *, void *, void *);
  	IOReturn trapRelease(void *id, void *, void *, void *, void *, void *);
@@ -198,7 +207,7 @@
  };
  
  OSDefineMetaClassAndStructors(IOSurfaceRootUserClient, IOUserClient);
-@@ -966,6 +1123,20 @@
+@@ -966,6 +1132,20 @@
  	char name[32];
  	proc_selfname(name, sizeof(name));
  	IOLog("SWEET SURF: %s %s %u\n", name, what, n);
@@ -219,7 +228,7 @@
  }
  
  bool
-@@ -1247,6 +1418,8 @@
+@@ -1247,6 +1427,8 @@
  		snprintf(tag, sizeof(tag), "SWEET SURF: bt %s id %u fmt 0x%x", name, s->id, s->pixelFormat);
  		sweet_prof_user_bt(tag);
  	}
@@ -228,7 +237,7 @@
  	props->release();
  	if (ret != kIOReturnSuccess) {
  		s->release();
-@@ -1315,6 +1488,12 @@
+@@ -1315,6 +1497,12 @@
  		}
  		if (args->structureOutput != NULL) {
  			bzero(args->structureOutput, args->structureOutputSize);
@@ -241,7 +250,7 @@
  		}
  		sweet_surf_log_once("sel", selector);
  		return kIOReturnSuccess;
-@@ -1343,12 +1522,22 @@
+@@ -1343,12 +1531,22 @@
  IOReturn IOSurfaceRootUserClient::trapIncrementUse(void *id, void *category, void *, void *, void *, void *)
  {
   if ((uintptr_t)id > UINT32_MAX || (uintptr_t)category >= 2) return kIOReturnBadArgument;
@@ -266,7 +275,7 @@
  }
  
  static IOReturn
-@@ -1384,14 +1573,33 @@
+@@ -1384,14 +1582,33 @@
  IOSurfaceRootUserClient::trapLock(void *id, void *options, void *seedOut,
      void *, void *, void *)
  {
@@ -304,7 +313,7 @@
  #endif
  	IOReturn ret = sweet_surface_seed_out(s, seedOut, false);
  	s->release();
-@@ -1402,15 +1610,25 @@
+@@ -1402,15 +1619,25 @@
  IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
      void *, void *, void *)
  {
@@ -333,7 +342,7 @@
  	s->release();
  	return ret;
  }
-@@ -1425,7 +1643,19 @@
+@@ -1425,7 +1652,19 @@
  		fRefs->removeObject(index);     /* unmaps and drops the user count */
  	}
  	IOLockUnlock(fLock);
@@ -354,7 +363,7 @@
  }
  
  static IOExternalTrap sweet_surface_traps[] = {
-@@ -1437,10 +1667,22 @@
+@@ -1437,10 +1676,22 @@
  	[kSweetSurfaceTrapReleaseFailed] = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },
  };
  
@@ -379,7 +388,7 @@
  	}
 --- a/xnu/fuxi-scanout/SweetSurface.h
 +++ b/xnu/fuxi-scanout/SweetSurface.h
-@@ -76,10 +76,38 @@
+@@ -76,10 +76,40 @@
  int sweet_surface_direct(SweetSurface *, uintptr_t src, unsigned sx, unsigned sy, unsigned width, unsigned height);
  #endif
  
@@ -399,10 +408,12 @@
 +void sweet_surface_fallback_record(SweetSurface *s);
 +bool sweet_surface_fallback_pick(sweet_fb_fallback *out);
 +
-+/* v28pull8: retained client surface matching w×h for the display pull.
-+ * Tier (a) newest BGRA8 single-plane direct-copy, else tier (b) newest b3a8
-+ * two-plane (existing CPU unpack). Caller releases *out. */
++/* v29pull10: retained client surface matching w×h for the display pull.
++ * tier 0 = newest BGRA8 single-plane direct-copy, tier 1 = newest b3a8
++ * two-plane (existing CPU unpack), tier 2 = BGRA8 first then b3a8.
++ * Caller releases *out. */
 +bool sweet_surface_pick_display(uint32_t w, uint32_t h, SweetSurface **out);
++bool sweet_surface_pick_display_tier(uint32_t w, uint32_t h, uint32_t tier, SweetSurface **out);
 +
  /* Retained surface for an id, or NULL. */
  SweetSurface *sweet_surface_copy(uint32_t id);
@@ -418,7 +429,7 @@
  
  /*
   * Publish physical memory (the panel framebuffer) as a surface. Returns a
-@@ -90,7 +118,7 @@
+@@ -90,7 +120,7 @@
      uint32_t height, uint32_t bytesPerRow, uint32_t pixelFormat);
  
  /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
@@ -744,7 +755,7 @@
   SwapStatus &status = fSwapStatus[id % SWEET_FB_SWAP_HISTORY];
   if (!id || id > fSwapID || status.id == id || status.state == SwapQueued || status.state == SwapConsumed || fScanoutHeld) {
    IOLockUnlock(fLock); return kIOReturnNotReady;
-@@ -1234,17 +1453,45 @@
+@@ -1234,17 +1453,60 @@
   IOLockWakeup(fLock, fSwapStatus, false);
  }
  
@@ -770,6 +781,21 @@
 +	return (uint32_t)lum | ((uint32_t)lum << 8) | ((uint32_t)lum << 16) | ((uint32_t)alpha << 24);
 +}
 +
++/* v29pull10: count nonzero bytes in [off, off+n) of a kernel buffer, bounded
++ * by len. Used to tell an empty surface from a painted one before copying. */
++static uint32_t
++fuxi_fb_nz_count(uintptr_t base, uint64_t len, uint64_t off, uint32_t n)
++{
++	if (base == 0 || len == 0) return 0;
++	if (off > len) off = len;
++	uint64_t avail = len - off;
++	if (avail < n) n = (uint32_t)avail;
++	const uint8_t *p = (const uint8_t *)(uintptr_t)base + off;
++	uint32_t nz = 0;
++	for (uint32_t i = 0; i < n; i++) if (p[i]) nz++;
++	return nz;
++}
++
 +/* Convert-path bookkeeping (file scope, one counter per boot). */
 +static uint32_t fConvertFrames, fConvertFails, fConvertOnce;
 +
@@ -791,7 +817,7 @@
  
  	if (!fConsolePaused) {
  		int quiet = 0;
-@@ -1268,15 +1515,23 @@
+@@ -1268,15 +1530,23 @@
  			continue;
  		}
  		SweetSurface *s = record.surfaces[layer]; if (s) s->retain();
@@ -815,7 +841,7 @@
  			OSSafeReleaseNULL(s);
  			continue;
  		}
-@@ -1317,13 +1572,92 @@
+@@ -1317,13 +1587,92 @@
  		if (h > (int32_t)fHeight - dy) {
  			h = (int32_t)fHeight - dy;
  		}
@@ -909,7 +935,7 @@
  			int copied = 0;
  #if defined(FUXI)
              /* Keep CPU replay complete too if a full composed crop is available. */
-@@ -1340,14 +1674,26 @@
+@@ -1340,14 +1689,26 @@
              /* fuxigpuncimport bit 24: VIG0 fetches the surface itself through a display IOVA slot; any refusal copies. */
              if (fScanout && (mask & (mask-1)) == 0) {
               int direct = sweet_surface_direct(s, src, sx, sy, w, h);
@@ -939,7 +965,7 @@
               s->release();
               return false; /* busy ring: keep the record for retry */
              }
-@@ -1368,7 +1714,9 @@
+@@ -1368,7 +1729,9 @@
               int writable = fuxi_gpu_scanout_cpu_acquire();
               if (writable != 1) {
                fScanoutHeld = writable < 0;
@@ -950,19 +976,38 @@
                s->release();
                return false;
               }
-@@ -1425,6 +1773,126 @@
+@@ -1425,6 +1788,145 @@
  		s->release();
  	}
  #if defined(FUXI)
-+	/* v28pull8: the record never carries an active layer (entries==0). Pull the
-+	 * newest matching backboardd surface into the configured primary scanout
-+	 * slot; completePresent commits it on the single present-path kick. */
++	/* v29pull10: record carries no active layer. Probe the newest BGRA8
++	 * surface; if blank, fall back to the newest b3a8 two-plane surface and
++	 * unpack. Pull writes the configured primary scanout slot; completePresent
++	 * commits it on the single present-path kick. */
 +	if (sweet_surface_combo_active() && fPresentEntries == 0) {
 +		SweetSurface *pull = NULL;
-+		if (!sweet_surface_pick_display(1125, 2436, &pull))
-+			sweet_surface_pick_display(fWidth, fHeight, &pull);
++		uint32_t probeFmt = 0, probeBpr = 0, nzFirst = 0, nzMid = 0;
++
++		if (!sweet_surface_pick_display_tier(1125, 2436, 0, &pull))
++			sweet_surface_pick_display_tier(fWidth, fHeight, 0, &pull);
++		if (pull != NULL) {
++			uintptr_t src0 = pull->kernelAddress();
++			uint64_t dlen0 = pull->memory ? pull->memory->getLength() : 0;
++			probeFmt = pull->pixelFormat; probeBpr = pull->bytesPerRow;
++			nzFirst = fuxi_fb_nz_count(src0, dlen0, 0, 4096);
++			uint64_t mid = (dlen0 / 2) & ~(uint64_t)15;
++			nzMid = fuxi_fb_nz_count(src0, dlen0, mid, 4096);
++			if (nzFirst == 0 && nzMid == 0) {
++				pull->release(); pull = NULL; /* blank 8-bit: try 10-bit */
++			}
++		}
 +		if (pull == NULL) {
-+			IOLog("FUXI SCANOUT: display pull none\n");
++			if (!sweet_surface_pick_display_tier(1125, 2436, 1, &pull))
++				sweet_surface_pick_display_tier(fWidth, fHeight, 1, &pull);
++		}
++		if (pull == NULL) {
++			IOLog("FUXI SCANOUT: display pull none probe fmt=0x%x bpr=%u nz_first=%u nz_mid=%u\n",
++			    probeFmt, probeBpr, nzFirst, nzMid);
 +		} else {
 +			uintptr_t src = pull->kernelAddress();
 +			uint64_t dlen = pull->memory ? pull->memory->getLength() : 0;
@@ -1077,7 +1122,7 @@
   fCpuFrames += cpuFrame;
   if (!gpuFrame) {
    fStage[3] = fStage[4] = mach_absolute_time();
-@@ -1432,6 +1900,14 @@
+@@ -1432,6 +1934,14 @@
    completePresent(mach_absolute_time() - t0);
    if (cpuFrame) scanoutLog(false, cpuBytes, cpuTicks, 0);
   }
@@ -1092,7 +1137,7 @@
  #endif
   return true;
  }
-@@ -1809,10 +2285,17 @@
+@@ -1809,10 +2319,17 @@
  	uint32_t outCount = 0;
  
  	switch (selector) {
