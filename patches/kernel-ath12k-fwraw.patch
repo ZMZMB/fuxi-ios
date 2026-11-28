@@ -70,3 +70,53 @@ diff --git a/xnu/fuxi-wlan/fuxi_wlan.c b/xnu/fuxi-wlan/fuxi_wlan.c
  		e = 5; goto close;
  	}
  	/* Qualcomm images need not be native ARM ELFs. Check ident, header size,
+@@ -3028,10 +3043,11 @@
+ wl_poll(unsigned mode)
+ {
+ 	uint32_t ee = 0, st = 0, bs = 0, es = 0, ctrl = 0;
+-	bool mismatch_logged = false, amss_logged = false;
++	bool mismatch_logged = false, amss_logged = false, restart_logged = false;
+ 	const char *why = "timeout";
+ 	int error = 2;
+-	for (unsigned i = 0; i <= 200; i++) {
++	unsigned limit = mode <= 1 ? 800 : 200;
++	for (unsigned i = 0; i <= limit; i++) {
+ 		if (wl_owned && ((wl_prd(wl_cb_addr(wl_cb) + 0x58) & 0xc00001fe) ||
+ 		    ((wl_prd(WL_SMMU + 0x48) & 2) && (wl_prd(WL_SMMU + 0x54) & 0xffff) == 0x1401))) {
+ 			(void)wl_smmu_fault(22 + mode);
+@@ -3041,7 +3057,19 @@
+ 		bs = wl_mrd(wl_bhi + 0x2c); es = wl_mrd(wl_bhie + WL_BHIE_TXSTATUS);
+ 		ctrl = wl_mrd(0x38);
+ 		uint32_t state = (st >> 8) & 255;
+-		if (fw_faults || ee == ~0u || st == ~0u || ctrl == ~0u) { why = "MMIO/access lost"; error = 1; break; }
++		if (fw_faults) { why = "MMIO/access lost"; error = 1; break; }
++		/* pblrestart: after the BHI doorbell the boot loader may reset the
++		 * endpoint core; every read then answers all-ones while the link
++		 * retrains. Linux mhi keeps polling on 0xffffffff instead of treating
++		 * it as a transfer error, so do the same for a bounded window. */
++		if (st == ~0u || ctrl == ~0u || ee == ~0u) {
++			if (!restart_logged) {
++				printf("FUXI WLAN: W10 device not answering (all-ones) after doorbell; waiting for the boot loader\n");
++				restart_logged = true;
++			}
++			if (i < limit) { wl_sleep(25); }
++			continue;
++		}
+ 		if (ee == 3) { why = "RDDM requested (RX sink only; no dump/retry)"; error = 1; break; }
+ 		if (ee == 6) { why = "EDL error EE"; error = 1; break; }
+ 		if (ee != 0 && ee != 1 && ee != 2) { why = "unsupported EE (including WFW/FP)"; error = 1; break; }
+@@ -3069,10 +3097,10 @@
+ 			    mode, ee, st, mode >= 3 ? "TXSTATUS" : "BHI STATUS", status, seq, i * 25);
+ 			return 0;
+ 		}
+-		if (i < 200) { wl_sleep(25); }
+-	}
+-	printf("FUXI WLAN: W10 poll mode %u %s EE %#x MHISTATUS %#x MHICTRL %#x BHI %#x TXSTATUS %#x expected seq %#x (limit 5000 ms)\n",
+-	    mode, why, ee, st, ctrl, bs, es, mode >= 3 ? wl_bhie_seq : wl_seq);
++		if (i < limit) { wl_sleep(25); }
++	}
++	printf("FUXI WLAN: W10 poll mode %u %s EE %#x MHISTATUS %#x MHICTRL %#x BHI %#x TXSTATUS %#x expected seq %#x (limit %u ms)\n",
++	    mode, why, ee, st, ctrl, bs, es, mode >= 3 ? wl_bhie_seq : wl_seq, limit * 25);
+ 	return error;
+ }
+ 
