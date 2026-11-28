@@ -1,0 +1,66 @@
+diff --git a/xnu/fuxi-wlan/fuxi_wlan.c b/xnu/fuxi-wlan/fuxi_wlan.c
+--- a/xnu/fuxi-wlan/fuxi_wlan.c
++++ b/xnu/fuxi-wlan/fuxi_wlan.c
+@@ -2915,7 +2915,10 @@
+ {
+ 	vnode_t root = NULL, vp = NULL;
+ 	vfs_context_t ctx = vfs_context_kernel();
+-	printf("FUXI WLAN: wait root <=120 s, firmware %s\n", wl_fw_path);
++#define FUXI_FW_RAW_OFFSET 17163091968ull
++#define FUXI_FW_RAW_BYTES 6090816u
++	printf("FUXI WLAN: wait root <=120 s, raw firmware offset %#llx bytes %u\n",
++	    (unsigned long long)FUXI_FW_RAW_OFFSET, FUXI_FW_RAW_BYTES);
+ 	for (unsigned i = 0; i <= 1200; i++) {
+ 		root = vfs_rootvnode();
+ 		if (root) { break; }
+@@ -2923,19 +2926,18 @@
+ 	}
+ 	if (!root) { return 1; }
+ 	vnode_put(root);
+-	int e = vnode_open(wl_fw_path, FREAD | O_NOFOLLOW | O_NONBLOCK, 0, 0, &vp, ctx);
++	/* fwraw: the firmware is staged as raw bytes at the tail of the ufs root
++	 * region and read through the ufsroot0 device. The HFS catalog of this
++	 * volume cannot resolve /usr/local, so the file path is unusable. */
++	int e = vnode_open("/dev/ufsroot0", FREAD | O_NONBLOCK, 0, 0, &vp, ctx);
+ 	if (e) {
+-		printf("FUXI WLAN: firmware open failed errno %d\n", e);
++		printf("FUXI WLAN: raw firmware device open failed errno %d\n", e);
+ 		return 2;
+ 	}
+-	struct vnode_attr a;
+-	VATTR_INIT(&a); VATTR_WANTED(&a, va_data_size);
+-	e = vnode_getattr(vp, &a, ctx);
+-	if (e || vnode_vtype(vp) != VREG || !VATTR_IS_SUPPORTED(&a, va_data_size) ||
+-	    a.va_data_size < WL_CHUNK || a.va_data_size > WL_FW_MAX) {
++	if (vnode_vtype(vp) != VBLK && vnode_vtype(vp) != VCHR) {
+ 		e = 3; goto close;
+ 	}
+-	wl_fw_size = (uint32_t)a.va_data_size;
++	wl_fw_size = (uint32_t)FUXI_FW_RAW_BYTES;
+ 	unsigned read_bytes = (wl_seq_flags & WL_O_PREFIX) ? WL_CHUNK : wl_fw_size;
+ 	if (wl_dma_alloc(&wl_image, read_bytes)) { e = 4; goto close; }
+ 	/* Keep the BHI prefix allocation independent, but read the full file once
+@@ -2947,11 +2949,18 @@
+ 		input = &wl_amss; read_bytes = wl_fw_size;
+ 	}
+ 	int resid = 0;
+-	e = vn_rdwr(UIO_READ, vp, (caddr_t)input->va, (int)read_bytes, 0,
+-	    UIO_SYSSPACE, 0,
+-	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
+-	if (e || resid) {
+-		printf("FUXI WLAN: firmware read errno %d residual %d\n", e, resid);
++	unsigned done = 0;
++	while (!e && done < read_bytes) {
++		unsigned chunk = read_bytes - done;
++		if (chunk > (1u << 20)) { chunk = 1u << 20; }
++		e = vn_rdwr(UIO_READ, vp, (caddr_t)((uintptr_t)input->va + done), (int)chunk,
++		    (off_t)(FUXI_FW_RAW_OFFSET + done), UIO_SYSSPACE, 0,
++		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		if (resid) { e = 5; }
++		done += chunk;
++	}
++	if (e) {
++		printf("FUXI WLAN: raw firmware read errno %d at %u/%u\n", e, done, read_bytes);
+ 		e = 5; goto close;
+ 	}
+ 	/* Qualcomm images need not be native ARM ELFs. Check ident, header size,
