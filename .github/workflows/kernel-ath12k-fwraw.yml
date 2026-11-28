@@ -1,0 +1,15 @@
+name: Build Fuxi ath12k kernel (kernel-ath12k-fwraw)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  kernel:
+    uses: ./.github/workflows/kernel-adsp-battery.yml
+    with:
+      ram_layout: full
+      artifact_name: fuxi-kernel-ath12k-fwraw
+      runner_label: macos-15-intel
+      ath12k: true
+      patch_name: kernel-ath12k-fwraw.patch
