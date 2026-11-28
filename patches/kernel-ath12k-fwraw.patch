@@ -13,7 +13,7 @@ diff --git a/xnu/fuxi-wlan/fuxi_wlan.c b/xnu/fuxi-wlan/fuxi_wlan.c
  	for (unsigned i = 0; i <= 1200; i++) {
  		root = vfs_rootvnode();
  		if (root) { break; }
-@@ -2923,19 +2926,18 @@
+@@ -2923,19 +2926,24 @@
  	}
  	if (!root) { return 1; }
  	vnode_put(root);
@@ -21,9 +21,15 @@ diff --git a/xnu/fuxi-wlan/fuxi_wlan.c b/xnu/fuxi-wlan/fuxi_wlan.c
 +	/* fwraw: the firmware is staged as raw bytes at the tail of the ufs root
 +	 * region and read through the ufsroot0 device. The HFS catalog of this
 +	 * volume cannot resolve /usr/local, so the file path is unusable. */
-+	int e = vnode_open("/dev/ufsroot0", FREAD | O_NONBLOCK, 0, 0, &vp, ctx);
++	/* ufsroot0 (block) is busy while it is the mount source; rufsroot0 is
++	 * the sibling char node with the same byte space, so try it first. */
++	int e = vnode_open("/dev/rufsroot0", FREAD | O_NONBLOCK, 0, 0, &vp, ctx);
  	if (e) {
 -		printf("FUXI WLAN: firmware open failed errno %d\n", e);
++		printf("FUXI WLAN: raw char device open errno %d, falling back to block\n", e);
++		e = vnode_open("/dev/ufsroot0", FREAD | O_NONBLOCK, 0, 0, &vp, ctx);
++	}
++	if (e) {
 +		printf("FUXI WLAN: raw firmware device open failed errno %d\n", e);
  		return 2;
  	}
@@ -40,7 +46,7 @@ diff --git a/xnu/fuxi-wlan/fuxi_wlan.c b/xnu/fuxi-wlan/fuxi_wlan.c
  	unsigned read_bytes = (wl_seq_flags & WL_O_PREFIX) ? WL_CHUNK : wl_fw_size;
  	if (wl_dma_alloc(&wl_image, read_bytes)) { e = 4; goto close; }
  	/* Keep the BHI prefix allocation independent, but read the full file once
-@@ -2947,11 +2949,18 @@
+@@ -2947,11 +2955,18 @@
  		input = &wl_amss; read_bytes = wl_fw_size;
  	}
  	int resid = 0;
